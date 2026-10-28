@@ -5,13 +5,15 @@ on:
   schedule:
     - cron: '30 0 * * *'
 
-  # Tự động quét lại ngay khi bạn Thêm / Sửa / Xóa domain trên giao diện Web
+  # Tự động quét lại ngay khi bạn Thêm / Sửa / Xóa domain hoặc cập nhật script quét
   push:
     branches:
       - main
       - master
     paths:
       - 'data/domains.json'
+      - 'scripts/monitor.py'
+      - '.github/workflows/monitor.yml'
 
   # Cho phép bấm nút "Quét ngay" hoặc "Gửi Email Test" từ giao diện Web
   workflow_dispatch:
@@ -55,7 +57,7 @@ jobs:
 
       - name: Install system whois & Python dependencies
         run: |
-          sudo apt-get update -y && sudo apt-get install -y whois
+          sudo apt-get update -y && sudo apt-get install -y whois dnsutils
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 

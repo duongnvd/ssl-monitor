@@ -17,6 +17,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -24,6 +25,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # Optional third-party imports with graceful fallback
+try:
+    import requests as pyrequests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
 try:
     from cryptography import x509
     from cryptography.hazmat.backends import default_backend
@@ -43,7 +50,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DOMAINS_FILE = BASE_DIR / "data" / "domains.json"
 RESULTS_FILE = BASE_DIR / "data" / "results.json"
 
-# Common multi-level Second-Level Domains (especially .vn and international)
 MULTI_PART_TLDS = {
     "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn", "int.vn", "ac.vn",
     "biz.vn", "info.vn", "name.vn", "pro.vn", "health.vn", "io.vn", "ai.vn",
@@ -109,10 +115,8 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
         s = val.strip()
         if not s:
             return None
-        # Handle numeric string timestamp
         if s.isdigit() and len(s) >= 10:
             return parse_any_date(int(s))
-        # Handle trailing Z or timezone offsets
         s_clean = re.sub(r"\s+\([A-Z]+\)$", "", s)
         if s_clean.endswith("Z"):
             s_clean = s_clean[:-1] + "+00:00"
@@ -192,6 +196,47 @@ def normalize_registrar_name(registrar: Optional[str], nameservers: Optional[Lis
     return reg or None
 
 
+def http_get_text(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 10) -> Optional[str]:
+    """Fetch URL text using requests (if available) or urllib."""
+    hdrs = headers or {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    if HAS_REQUESTS:
+        try:
+            r = pyrequests.get(url, headers=hdrs, timeout=timeout)
+            if r.status_code == 200 and r.text:
+                return r.text
+        except Exception:
+            pass
+    try:
+        req = urllib.request.Request(url, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return None
+
+
+def query_doh_nameservers(root_domain: str, timeout: int = 6) -> List[str]:
+    """Fetch NS records for root_domain via Cloudflare DNS-over-HTTPS."""
+    try:
+        url = f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(root_domain)}&type=NS"
+        txt = http_get_text(url, headers={"Accept": "application/dns-json"}, timeout=timeout)
+        if txt:
+            data = json.loads(txt)
+            ns_list = [
+                str(ans.get("data", "")).lower().rstrip(".")
+                for ans in (data.get("Answer") or [])
+                if ans.get("type") == 2 and ans.get("data")
+            ]
+            return list(dict.fromkeys(ns_list))[:6]
+    except Exception:
+        pass
+    return []
+
+
 def classify_status(days_left: Optional[int], warn_days: int, crit_days: int, has_error: bool = False) -> str:
     if has_error or days_left is None:
         return "error"
@@ -214,7 +259,6 @@ def check_ssl_certificate(
     """
     Connects to hostname:port via TLS, verifies certificate chain, and extracts
     expiration date, issuer, subject, SANs, protocol, cipher, and IP.
-    Even if the certificate is expired or self-signed, extracts certificate metadata.
     """
     result: Dict[str, Any] = {
         "ssl_checked": True,
@@ -267,7 +311,7 @@ def check_ssl_certificate(
         result["ssl_error"] = f"TLS Connection failed: {conn_err}"
         return result
 
-    # Step 2: If verification failed, fetch binary DER certificate with CERT_NONE to still get expiry/issuer
+    # Step 2: If verification failed, fetch binary DER certificate with CERT_NONE
     if der_cert is None:
         unverified_ctx = ssl.create_default_context()
         unverified_ctx.check_hostname = False
@@ -285,7 +329,6 @@ def check_ssl_certificate(
             result["ssl_error"] = f"TLS Handshake failed: {conn_err}"
             return result
 
-    # Step 3: Parse DER certificate via cryptography (preferred) or standard peer_cert_dict
     valid_from: Optional[datetime.datetime] = None
     valid_to: Optional[datetime.datetime] = None
 
@@ -295,7 +338,6 @@ def check_ssl_certificate(
             valid_from = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before.replace(tzinfo=datetime.timezone.utc)
             valid_to = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
 
-            # Extract Issuer Organization / CN
             issuer_org = cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
             issuer_cn = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
             issuer_parts = []
@@ -307,14 +349,10 @@ def check_ssl_certificate(
                     issuer_parts.append(cn_val)
             result["ssl_issuer"] = " - ".join(issuer_parts) if issuer_parts else cert.issuer.rfc4514_string()
 
-            # Extract Subject CN
             subj_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
             result["ssl_subject"] = str(subj_cn[0].value) if subj_cn else cert.subject.rfc4514_string()
-
-            # Serial number
             result["ssl_serial"] = format(cert.serial_number, "X")
 
-            # Subject Alternative Names (SANs)
             try:
                 ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
                 sans = ext.value.get_values_for_type(x509.DNSName)
@@ -324,7 +362,6 @@ def check_ssl_certificate(
         except Exception as parse_err:
             result["ssl_error"] = f"Cert parse error: {parse_err}"
 
-    # Fallback to peer_cert_dict from standard library if cryptography wasn't available
     if valid_to is None and peer_cert_dict:
         valid_from = parse_any_date(peer_cert_dict.get("notBefore"))
         valid_to = parse_any_date(peer_cert_dict.get("notAfter"))
@@ -346,7 +383,6 @@ def check_ssl_certificate(
         result["ssl_valid_from"] = valid_from.strftime("%Y-%m-%d %H:%M UTC") if valid_from else None
         result["ssl_valid_to"] = valid_to.strftime("%Y-%m-%d %H:%M UTC")
         result["ssl_status"] = classify_status(days_left, warn_days, crit_days, has_error=False)
-        # If cert is untrusted (e.g. self-signed or wrong hostname) and not already expired, mark warning/critical
         if not result["ssl_trusted"] and result["ssl_status"] == "ok":
             result["ssl_status"] = "warning"
     else:
@@ -365,55 +401,55 @@ def query_rdap_domain(root_domain: str, timeout: int = 8) -> Optional[Dict[str, 
 
     for url in urls:
         try:
-            req = urllib.request.Request(
+            txt = http_get_text(
                 url,
                 headers={
                     "Accept": "application/rdap+json, application/json",
                     "User-Agent": "SysadminSSLMonitor/1.0 (+https://duongnvd.github.io)",
                 },
+                timeout=timeout,
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status != 200:
-                    continue
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                events = data.get("events", [])
-                exp_date = None
-                reg_date = None
-                for ev in events:
-                    action = (ev.get("eventAction") or "").lower()
-                    ev_date = parse_any_date(ev.get("eventDate"))
-                    if "expir" in action and ev_date:
-                        exp_date = ev_date
-                    elif "registr" in action and ev_date:
-                        reg_date = ev_date
+            if not txt:
+                continue
+            data = json.loads(txt)
+            events = data.get("events", [])
+            exp_date = None
+            reg_date = None
+            for ev in events:
+                action = (ev.get("eventAction") or "").lower()
+                ev_date = parse_any_date(ev.get("eventDate"))
+                if "expir" in action and ev_date:
+                    exp_date = ev_date
+                elif "registr" in action and ev_date:
+                    reg_date = ev_date
 
-                registrar = None
-                for ent in data.get("entities", []):
-                    roles = [r.lower() for r in ent.get("roles", [])]
-                    if "registrar" in roles:
-                        vcard = ent.get("vcardArray", [])
-                        if len(vcard) > 1 and isinstance(vcard[1], list):
-                            for item in vcard[1]:
-                                if isinstance(item, list) and len(item) >= 4 and item[0] in ("fn", "org"):
-                                    registrar = str(item[3])
-                                    break
-                        if not registrar and ent.get("handle"):
-                            registrar = str(ent.get("handle"))
+            registrar = None
+            for ent in data.get("entities", []):
+                roles = [r.lower() for r in ent.get("roles", [])]
+                if "registrar" in roles:
+                    vcard = ent.get("vcardArray", [])
+                    if len(vcard) > 1 and isinstance(vcard[1], list):
+                        for item in vcard[1]:
+                            if isinstance(item, list) and len(item) >= 4 and item[0] in ("fn", "org"):
+                                registrar = str(item[3])
+                                break
+                    if not registrar and ent.get("handle"):
+                        registrar = str(ent.get("handle"))
 
-                nameservers = []
-                for ns in data.get("nameservers", []):
-                    ldh = ns.get("ldhName")
-                    if ldh:
-                        nameservers.append(ldh.lower())
+            nameservers = []
+            for ns in data.get("nameservers", []):
+                ldh = ns.get("ldhName")
+                if ldh:
+                    nameservers.append(ldh.lower())
 
-                if exp_date:
-                    return {
-                        "expiry_date": exp_date,
-                        "creation_date": reg_date,
-                        "registrar": registrar,
-                        "nameservers": nameservers[:6],
-                        "source": "RDAP",
-                    }
+            if exp_date:
+                return {
+                    "expiry_date": exp_date,
+                    "creation_date": reg_date,
+                    "registrar": registrar,
+                    "nameservers": nameservers[:6],
+                    "source": "RDAP",
+                }
         except Exception:
             continue
     return None
@@ -423,7 +459,6 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
     """Fallback raw socket port 43 WHOIS lookup using IANA referral."""
     try:
         tld = root_domain.split(".")[-1]
-        # Query IANA for TLD whois server
         whois_server = None
         with socket.create_connection(("whois.iana.org", 43), timeout=timeout) as s:
             s.sendall(f"{tld}\r\n".encode("utf-8"))
@@ -504,130 +539,150 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
     return None
 
 
-def query_vn_registrar_whois(root_domain: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
+    """Parse either JSON or HTML/text from Vietnamese WHOIS gateways."""
+    if not raw_payload or not raw_payload.strip():
+        return None
+
+    # Try JSON first
+    try:
+        data = json.loads(raw_payload)
+        if isinstance(data, dict) and data.get("contents"):
+            # Unwrap allorigins JSON wrapper if present
+            data = json.loads(data["contents"])
+        if isinstance(data, dict):
+            exp_raw = (
+                data.get("expirationDate")
+                or data.get("expireDate")
+                or data.get("expiration_date")
+                or data.get("registryExpiryDate")
+                or data.get("expiredDate")
+            )
+            reg_raw = (
+                data.get("creationDate")
+                or data.get("createDate")
+                or data.get("creation_date")
+                or data.get("issueDate")
+            )
+            exp_date = parse_any_date(exp_raw)
+            reg_date = parse_any_date(reg_raw)
+            registrar = data.get("registrar") or data.get("registrarName")
+
+            raw_ns = data.get("nameServer") or data.get("nameServers") or data.get("nameservers") or []
+            if isinstance(raw_ns, str):
+                raw_ns = [x.strip() for x in re.split(r"[,;\s]+", raw_ns) if x.strip()]
+            nameservers = [str(ns).lower().rstrip(".") for ns in raw_ns if ns][:6]
+
+            raw_text = str(data.get("rawtext") or data.get("rawText") or "")
+            if not exp_date and raw_text:
+                m = re.search(
+                    r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*[:\-]?\s*([^\r\n]+)",
+                    raw_text,
+                    re.IGNORECASE,
+                )
+                if m:
+                    exp_date = parse_any_date(m.group(1).strip())
+            if not reg_date and raw_text:
+                m = re.search(
+                    r"(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)",
+                    raw_text,
+                    re.IGNORECASE,
+                )
+                if m:
+                    reg_date = parse_any_date(m.group(1).strip())
+            if not registrar and raw_text:
+                m = re.search(
+                    r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)",
+                    raw_text,
+                    re.IGNORECASE,
+                )
+                if m:
+                    registrar = m.group(1).strip()
+
+            if exp_date:
+                return {
+                    "expiry_date": exp_date,
+                    "creation_date": reg_date,
+                    "registrar": normalize_registrar_name(str(registrar) if registrar else None, nameservers),
+                    "nameservers": nameservers,
+                    "source": "VNNIC / VN-WHOIS",
+                }
+    except Exception:
+        pass
+
+    # Fallback: parse HTML or plain text
+    clean_txt = re.sub(r"<[^>]+>", "\n", raw_payload)
+    exp_date = None
+    for pat in [
+        r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn)\s*[:\-]?\s*([^\r\n]+)",
+    ]:
+        m = re.search(pat, clean_txt, re.IGNORECASE)
+        if m:
+            exp_date = parse_any_date(m.group(1).strip())
+            if exp_date:
+                break
+    if not exp_date:
+        return None
+
+    reg_date = None
+    for pat in [
+        r"(?:Creation Date|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)",
+    ]:
+        m = re.search(pat, clean_txt, re.IGNORECASE)
+        if m:
+            reg_date = parse_any_date(m.group(1).strip())
+            if reg_date:
+                break
+
+    registrar = None
+    for pat in [
+        r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)",
+    ]:
+        m = re.search(pat, clean_txt, re.IGNORECASE)
+        if m:
+            registrar = m.group(1).strip()
+            break
+
+    return {
+        "expiry_date": exp_date,
+        "creation_date": reg_date,
+        "registrar": normalize_registrar_name(registrar, []),
+        "nameservers": [],
+        "source": "VN-WHOIS",
+    }
+
+
+def query_vn_registrar_whois(root_domain: str, timeout: int = 12) -> Optional[Dict[str, Any]]:
     """
-    Query Vietnamese accredited VNNIC registrar WHOIS gateways (works for all .vn domains
-    bought at Mắt Bão, Tenten, PA Việt Nam, Nhân Hòa, iNET, etc., as well as international TLDs).
+    Query Vietnamese accredited VNNIC registrar WHOIS gateways across multiple direct
+    and relay endpoints so even US GitHub Actions runners can resolve .vn domains reliably.
     """
+    inet_url = f"https://whois.inet.vn/api/whois/domainspecify/{urllib.parse.quote(root_domain)}"
+    pa_url = f"https://whois.pavietnam.vn/whois.php?domain={urllib.parse.quote(root_domain)}&cmd=get_whois"
+
+    candidate_urls = [
+        inet_url,
+        f"https://api.allorigins.win/raw?url={urllib.parse.quote(inet_url, safe='')}",
+        f"https://api.codetabs.com/v1/proxy?quest={inet_url}",
+        f"https://corsproxy.io/?{urllib.parse.quote(inet_url, safe='')}",
+        pa_url,
+        f"https://api.allorigins.win/raw?url={urllib.parse.quote(pa_url, safe='')}",
+        f"https://api.codetabs.com/v1/proxy?quest={pa_url}",
+    ]
+
     headers = {
         "Accept": "application/json, text/plain, */*",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": "https://whois.inet.vn/",
     }
 
-    # 1. Primary VNNIC / Registrar JSON Gateway (whois.inet.vn)
-    try:
-        url = f"https://whois.inet.vn/api/whois/domainspecify/{root_domain}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                if isinstance(data, dict):
-                    exp_raw = (
-                        data.get("expirationDate")
-                        or data.get("expireDate")
-                        or data.get("expiration_date")
-                        or data.get("registryExpiryDate")
-                    )
-                    reg_raw = (
-                        data.get("creationDate")
-                        or data.get("createDate")
-                        or data.get("creation_date")
-                        or data.get("issueDate")
-                    )
-                    exp_date = parse_any_date(exp_raw)
-                    reg_date = parse_any_date(reg_raw)
-                    registrar = data.get("registrar") or data.get("registrarName")
-
-                    raw_ns = data.get("nameServer") or data.get("nameServers") or data.get("nameservers") or []
-                    if isinstance(raw_ns, str):
-                        raw_ns = [x.strip() for x in re.split(r"[,;\s]+", raw_ns) if x.strip()]
-                    nameservers = [str(ns).lower().rstrip(".") for ns in raw_ns if ns][:6]
-
-                    # Also check rawtext if structured date was missing
-                    raw_text = str(data.get("rawtext") or data.get("rawText") or "")
-                    if not exp_date and raw_text:
-                        for pat in [
-                            r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*:\s*([^\r\n]+)",
-                        ]:
-                            m = re.search(pat, raw_text, re.IGNORECASE)
-                            if m:
-                                exp_date = parse_any_date(m.group(1).strip())
-                                if exp_date:
-                                    break
-                    if not reg_date and raw_text:
-                        for pat in [
-                            r"(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)\s*:\s*([^\r\n]+)",
-                        ]:
-                            m = re.search(pat, raw_text, re.IGNORECASE)
-                            if m:
-                                reg_date = parse_any_date(m.group(1).strip())
-                                if reg_date:
-                                    break
-                    if not registrar and raw_text:
-                        for pat in [
-                            r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*:\s*([^\r\n]+)",
-                        ]:
-                            m = re.search(pat, raw_text, re.IGNORECASE)
-                            if m:
-                                registrar = m.group(1).strip()
-                                break
-
-                    if exp_date:
-                        return {
-                            "expiry_date": exp_date,
-                            "creation_date": reg_date,
-                            "registrar": normalize_registrar_name(str(registrar) if registrar else None, nameservers),
-                            "nameservers": nameservers,
-                            "source": "VNNIC / VN-WHOIS",
-                        }
-    except Exception:
-        pass
-
-    # 2. Secondary fallback via PA Vietnam WHOIS gateway
-    try:
-        url_pa = f"https://whois.pavietnam.vn/whois.php?domain={root_domain}&cmd=get_whois"
-        req_pa = urllib.request.Request(url_pa, headers=headers)
-        with urllib.request.urlopen(req_pa, timeout=timeout) as resp:
-            if resp.status == 200:
-                raw_html = resp.read().decode("utf-8", errors="replace")
-                clean_txt = re.sub(r"<[^>]+>", "\n", raw_html)
-                exp_date = None
-                for pat in [
-                    r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn)\s*[:\-]?\s*([^\r\n]+)",
-                ]:
-                    m = re.search(pat, clean_txt, re.IGNORECASE)
-                    if m:
-                        exp_date = parse_any_date(m.group(1).strip())
-                        if exp_date:
-                            break
-                reg_date = None
-                for pat in [
-                    r"(?:Creation Date|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)",
-                ]:
-                    m = re.search(pat, clean_txt, re.IGNORECASE)
-                    if m:
-                        reg_date = parse_any_date(m.group(1).strip())
-                        if reg_date:
-                            break
-                registrar = None
-                for pat in [
-                    r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)",
-                ]:
-                    m = re.search(pat, clean_txt, re.IGNORECASE)
-                    if m:
-                        registrar = m.group(1).strip()
-                        break
-                if exp_date:
-                    return {
-                        "expiry_date": exp_date,
-                        "creation_date": reg_date,
-                        "registrar": normalize_registrar_name(registrar, []),
-                        "nameservers": [],
-                        "source": "VN-WHOIS (PA)",
-                    }
-    except Exception:
-        pass
+    for url in candidate_urls:
+        txt = http_get_text(url, headers=headers, timeout=timeout)
+        if not txt:
+            continue
+        parsed = parse_vn_whois_payload(txt)
+        if parsed and parsed.get("expiry_date"):
+            return parsed
 
     return None
 
@@ -637,11 +692,11 @@ def check_domain_registration(
     custom_expiry: str = "",
     warn_days: int = 30,
     crit_days: int = 14,
+    cached_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Checks domain WHOIS / RDAP expiration date, registrar, creation date, and nameservers.
     Supports .vn domains (Mắt Bão, Tenten, PA, Nhân Hòa, iNET) and international TLDs.
-    Supports manual override via custom_expiry (YYYY-MM-DD) for private/restricted TLDs.
     """
     root_domain = extract_root_domain(hostname)
     result: Dict[str, Any] = {
@@ -660,7 +715,7 @@ def check_domain_registration(
     exp_dt: Optional[datetime.datetime] = None
     reg_dt: Optional[datetime.datetime] = None
     registrar: Optional[str] = None
-    nameservers: List[str] = []
+    nameservers: List[str] = query_doh_nameservers(root_domain)
     source: Optional[str] = None
 
     # 1. For .vn domains, query VNNIC / Vietnamese Registrar WHOIS API first
@@ -670,7 +725,8 @@ def check_domain_registration(
             exp_dt = vn_info["expiry_date"]
             reg_dt = vn_info.get("creation_date")
             registrar = vn_info.get("registrar")
-            nameservers = vn_info.get("nameservers") or []
+            if vn_info.get("nameservers"):
+                nameservers = vn_info["nameservers"]
             source = vn_info.get("source", "VNNIC WHOIS")
 
     # 2. Try RDAP (fast, structured for .com, .net, .org, .io, .dev, etc.)
@@ -680,20 +736,22 @@ def check_domain_registration(
             exp_dt = rdap_info["expiry_date"]
             reg_dt = rdap_info.get("creation_date")
             registrar = rdap_info.get("registrar")
-            nameservers = rdap_info.get("nameservers") or []
+            if rdap_info.get("nameservers"):
+                nameservers = rdap_info["nameservers"]
             source = rdap_info.get("source", "RDAP")
 
-    # 3. Try Vietnamese Registrar WHOIS API as universal fallback for international domains bought on Tenten / Mắt Bão
+    # 3. Try Vietnamese Registrar WHOIS API as universal fallback for international domains
     if exp_dt is None and not root_domain.endswith(".vn"):
         vn_fallback = query_vn_registrar_whois(root_domain)
         if vn_fallback and vn_fallback.get("expiry_date"):
             exp_dt = vn_fallback["expiry_date"]
             reg_dt = vn_fallback.get("creation_date")
             registrar = vn_fallback.get("registrar")
-            nameservers = vn_fallback.get("nameservers") or []
+            if vn_fallback.get("nameservers"):
+                nameservers = vn_fallback["nameservers"]
             source = vn_fallback.get("source", "VN-WHOIS")
 
-    # 4. Fallback to python-whois (only for non-.vn domains since VNNIC disabled port 43)
+    # 4. Fallback to python-whois
     if exp_dt is None and HAS_PYWHOIS and not root_domain.endswith(".vn"):
         try:
             w = pywhois.whois(root_domain)
@@ -707,7 +765,8 @@ def check_domain_registration(
             raw_ns = getattr(w, "name_servers", None) or w.get("name_servers") or []
             if isinstance(raw_ns, str):
                 raw_ns = [raw_ns]
-            nameservers = list(dict.fromkeys([str(ns).lower().rstrip(".") for ns in raw_ns if ns]))[:6]
+            if raw_ns:
+                nameservers = list(dict.fromkeys([str(ns).lower().rstrip(".") for ns in raw_ns if ns]))[:6]
             if exp_dt:
                 source = "WHOIS"
         except Exception as exc:
@@ -720,10 +779,20 @@ def check_domain_registration(
             exp_dt = raw_info["expiry_date"]
             reg_dt = raw_info.get("creation_date") or reg_dt
             registrar = raw_info.get("registrar") or registrar
-            nameservers = raw_info.get("nameservers") or nameservers
+            if raw_info.get("nameservers"):
+                nameservers = raw_info["nameservers"]
             source = raw_info.get("source", "Raw WHOIS")
 
-    # 6. Manual override (`custom_domain_expiry` in domains.json)
+    # 6. Fallback to cached WHOIS info synced from Browser in Vietnam (if US runner was geo-blocked)
+    if exp_dt is None and cached_info:
+        c_exp = parse_any_date(cached_info.get("cached_domain_expiry"))
+        if c_exp:
+            exp_dt = c_exp
+            reg_dt = parse_any_date(cached_info.get("cached_creation_date")) or reg_dt
+            registrar = cached_info.get("cached_registrar") or registrar
+            source = "VNNIC (Đồng bộ)"
+
+    # 7. Manual override (`custom_domain_expiry` in domains.json)
     if custom_expiry and custom_expiry.strip():
         manual_dt = parse_any_date(custom_expiry.strip())
         if manual_dt:
@@ -731,6 +800,8 @@ def check_domain_registration(
             source = "Manual Config" if not source else f"{source} + Manual"
 
     registrar = normalize_registrar_name(registrar, nameservers)
+    result["domain_registrar"] = registrar or "—"
+    result["domain_nameservers"] = nameservers
 
     if exp_dt is not None:
         now = now_utc()
@@ -739,7 +810,6 @@ def check_domain_registration(
         result["domain_expiry_date"] = exp_dt.strftime("%Y-%m-%d")
         result["domain_creation_date"] = reg_dt.strftime("%Y-%m-%d") if reg_dt else None
         result["domain_registrar"] = registrar or "Unknown Registrar"
-        result["domain_nameservers"] = nameservers
         result["domain_source"] = source
         result["domain_status"] = classify_status(days_left, warn_days, crit_days, has_error=False)
         result["domain_error"] = None
@@ -790,7 +860,11 @@ def scan_single_entry(entry: Dict[str, Any], settings: Dict[str, Any]) -> Dict[s
 
     if check_domain:
         dom_res = check_domain_registration(
-            hostname, custom_expiry=custom_expiry, warn_days=warn_dom, crit_days=crit_dom
+            hostname,
+            custom_expiry=custom_expiry,
+            warn_days=warn_dom,
+            crit_days=crit_dom,
+            cached_info=entry,
         )
         item.update(dom_res)
     else:
@@ -801,7 +875,6 @@ def scan_single_entry(entry: Dict[str, Any], settings: Dict[str, Any]) -> Dict[s
             "domain_days_left": None,
         })
 
-    # Compute overall status for sorting and filtering
     statuses = [item.get("ssl_status"), item.get("domain_status")]
     priority = ["expired", "error", "critical", "warning", "ok", "unknown", "skipped"]
     overall = "ok"
@@ -926,17 +999,7 @@ def send_smtp_email(
     html_body: str,
     recipients: List[str],
 ) -> bool:
-    """
-    Sends HTML email via Corporate Groupware SMTP or Gmail SMTP.
-    Environment variables supported:
-      SMTP_HOST       - e.g., mail.company.com or smtp.gmail.com
-      SMTP_PORT       - e.g., 587 (STARTTLS), 465 (SSL), or 25 (Relay/Plain/STARTTLS)
-      SMTP_USER       - optional if internal relay on port 25, or username/email
-      SMTP_PASS       - SMTP password / App password
-      SMTP_FROM       - Sender address, e.g. "Sysadmin Monitor <monitor@company.com>"
-      SMTP_SECURITY   - "auto" (default), "starttls", "ssl", "none"
-      SMTP_SKIP_TLS_VERIFY - "true" if internal groupware uses self-signed certificate
-    """
+    """Sends HTML email via Corporate Groupware SMTP or Gmail SMTP."""
     smtp_host = os.environ.get("SMTP_HOST", "").strip()
     smtp_port = int(os.environ.get("SMTP_PORT", "587").strip() or "587")
     smtp_user = os.environ.get("SMTP_USER", "").strip()
@@ -1023,10 +1086,9 @@ def main() -> int:
             print(
                 f"  - {res['domain']}:{res['port']} -> "
                 f"SSL: {res.get('ssl_status')} ({res.get('ssl_days_left')}d) | "
-                f"Domain: {res.get('domain_status')} ({res.get('domain_days_left')}d)"
+                f"Domain: {res.get('domain_status')} ({res.get('domain_days_left')}d, Reg: {res.get('domain_registrar')})"
             )
 
-    # Sort items by lowest days left (most urgent first)
     def sort_key(x: Dict[str, Any]) -> Tuple[int, int, str]:
         status_order = {"expired": 0, "error": 1, "critical": 2, "warning": 3, "ok": 4, "unknown": 5, "skipped": 6}
         s_ord = status_order.get(x.get("overall_status", "ok"), 9)
@@ -1065,7 +1127,6 @@ def main() -> int:
 
     print(f"[+] Đã lưu kết quả tại: {output_path}")
 
-    # Determine whether to send email alerts
     alert_items = [
         x for x in items if x.get("overall_status") in ("expired", "error", "critical", "warning")
     ]
@@ -1086,7 +1147,6 @@ def main() -> int:
         subject, html_body = build_email_html(items, alert_items, settings, is_test=args.test_email)
         send_smtp_email(subject, html_body, global_recipients)
 
-        # Also check if any alerting domain has specific per-domain notify_emails
         per_recipient_items: Dict[str, List[Dict[str, Any]]] = {}
         for it in alert_items:
             for extra_email in it.get("notify_emails") or []:

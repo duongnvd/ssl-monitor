@@ -188,9 +188,41 @@ async function loadAllData() {
 
     mergeConfigIntoResults();
     renderAll();
+
+    // Automatically resolve any domain missing WHOIS expiry date directly from the browser
+    await autoResolveMissingDomains();
   } catch (err) {
     console.error("Failed to load data:", err);
     showBanner(`Không thể tải dữ liệu: ${err.message}`, true);
+  }
+}
+
+async function autoResolveMissingDomains() {
+  const entriesToResolve = [];
+  for (const d of state.domainsConfig.domains || []) {
+    if (d.check_domain === false) continue;
+    const host = cleanHostname(d.domain);
+    const port = Number(d.port || 443);
+    const item = (state.resultsData.items || []).find(
+      (x) => x.domain === host && Number(x.port || 443) === port
+    );
+    if (!item || !item.domain_expiry_date || item.domain_status === "unknown") {
+      entriesToResolve.push(d);
+    }
+  }
+
+  if (entriesToResolve.length === 0) return;
+
+  let anyCacheUpdated = false;
+  for (const entry of entriesToResolve) {
+    const updatedCache = await performBrowserLiveCheck(entry);
+    if (updatedCache) anyCacheUpdated = true;
+  }
+
+  if (anyCacheUpdated && state.ghConfig.token) {
+    try {
+      await saveDomainsConfig("chore(whois): đồng bộ dữ liệu WHOIS tên miền .vn", true);
+    } catch (_) {}
   }
 }
 
@@ -213,12 +245,21 @@ function mergeConfigIntoResults() {
       prev.notes = d.notes || "";
       prev.notify_emails = d.notify_emails || [];
       prev.custom_domain_expiry = d.custom_domain_expiry || "";
-      if (d.custom_domain_expiry) {
-        const expMs = Date.parse(d.custom_domain_expiry);
-        if (!isNaN(expMs)) {
-          const days = Math.floor((expMs - Date.now()) / 86400000);
+
+      const overrideExp = d.custom_domain_expiry || (!prev.domain_expiry_date ? d.cached_domain_expiry : "");
+      if (overrideExp) {
+        const expDt = parseFlexibleDate(overrideExp);
+        if (expDt) {
+          const days = Math.floor((expDt.getTime() - Date.now()) / 86400000);
           prev.domain_days_left = days;
-          prev.domain_expiry_date = d.custom_domain_expiry;
+          prev.domain_expiry_date = expDt.toISOString().slice(0, 10);
+          if (d.cached_creation_date && !prev.domain_creation_date) {
+            prev.domain_creation_date = d.cached_creation_date;
+          }
+          if (d.cached_registrar && (!prev.domain_registrar || prev.domain_registrar === "—")) {
+            prev.domain_registrar = d.cached_registrar;
+          }
+          prev.domain_error = null;
           prev.domain_status = classifyStatus(
             days,
             state.domainsConfig.settings.alert_days_domain || 30,
@@ -247,8 +288,8 @@ function mergeConfigIntoResults() {
         domain_root: extractRootDomain(host),
         domain_status: "unknown",
         domain_days_left: null,
-        domain_expiry_date: d.custom_domain_expiry || null,
-        domain_registrar: "Đang tra cứu VNNIC / RDAP...",
+        domain_expiry_date: d.custom_domain_expiry || d.cached_domain_expiry || null,
+        domain_registrar: d.cached_registrar || "Đang tra cứu VNNIC / RDAP...",
         overall_status: "unknown",
       });
     }
@@ -279,9 +320,14 @@ function parseFlexibleDate(raw) {
   }
   const s = String(raw).trim();
   if (!s) return null;
-  const mDmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})/);
+  const mDmy = s.match(/(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})/);
   if (mDmy) {
     const d = new Date(Date.UTC(Number(mDmy[3]), Number(mDmy[2]) - 1, Number(mDmy[1])));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const mYmd = s.match(/(20\d{2}|19\d{2})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (mYmd) {
+    const d = new Date(Date.UTC(Number(mYmd[1]), Number(mYmd[2]) - 1, Number(mYmd[3])));
     if (!isNaN(d.getTime())) return d;
   }
   const dIso = new Date(s);
@@ -313,12 +359,66 @@ function normalizeRegistrar(reg, nameservers = []) {
   return r || null;
 }
 
+function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
+  if (!rawText) return null;
+  try {
+    let data = JSON.parse(rawText);
+    if (data && typeof data.contents === "string") {
+      data = JSON.parse(data.contents);
+    }
+    if (data && typeof data === "object") {
+      let expDate = parseFlexibleDate(
+        data.expirationDate || data.expireDate || data.expiration_date || data.registryExpiryDate || data.expiredDate
+      );
+      let regDate = parseFlexibleDate(
+        data.creationDate || data.createDate || data.creation_date || data.issueDate
+      );
+      let registrar = data.registrar || data.registrarName || "";
+      const nsList = Array.isArray(data.nameServer)
+        ? data.nameServer.map((n) => String(n).toLowerCase())
+        : fallbackNs;
+
+      const raw = String(data.rawtext || data.rawText || "");
+      if (!expDate && raw) {
+        const m = raw.match(/(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*[:\-]?\s*([^\r\n]+)/i);
+        if (m) expDate = parseFlexibleDate(m[1]);
+      }
+      if (!regDate && raw) {
+        const m = raw.match(/(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)/i);
+        if (m) regDate = parseFlexibleDate(m[1]);
+      }
+      if (!registrar && raw) {
+        const m = raw.match(/(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)/i);
+        if (m) registrar = m[1].trim();
+      }
+      if (expDate) {
+        return { expDate, regDate, registrar, nsList };
+      }
+    }
+  } catch (_) {}
+
+  const clean = String(rawText).replace(/<[^>]+>/g, "\n");
+  const mExp = clean.match(/(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn)\s*[:\-]?\s*([^\r\n]+)/i);
+  if (!mExp) return null;
+  const expDate = parseFlexibleDate(mExp[1]);
+  if (!expDate) return null;
+
+  const mReg = clean.match(/(?:Creation Date|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)/i);
+  const regDate = mReg ? parseFlexibleDate(mReg[1]) : null;
+  const mRegistrar = clean.match(/(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)/i);
+  const registrar = mRegistrar ? mRegistrar[1].trim() : "";
+
+  return { expDate, regDate, registrar, nsList: fallbackNs };
+}
+
 async function performBrowserLiveCheck(domainEntry) {
   const host = cleanHostname(domainEntry.domain);
   const port = Number(domainEntry.port || 443);
   const rootDomain = extractRootDomain(host);
   const item = state.resultsData.items.find((x) => x.domain === host && Number(x.port || 443) === port);
-  if (!item) return;
+  if (!item) return false;
+
+  let cacheChanged = false;
 
   // 1. Resolve IP & Nameservers via Cloudflare DNS-over-HTTPS
   try {
@@ -343,38 +443,45 @@ async function performBrowserLiveCheck(domainEntry) {
       if (nsList.length > 0) {
         item.domain_nameservers = nsList.slice(0, 6);
         const inferredReg = normalizeRegistrar("", nsList);
-        if (inferredReg && (!item.domain_registrar || item.domain_registrar.includes("Đang tra cứu"))) {
+        if (inferredReg && (!item.domain_registrar || item.domain_registrar === "—" || item.domain_registrar.includes("Đang tra cứu"))) {
           item.domain_registrar = inferredReg;
         }
       }
     }
   } catch (_) {}
 
-  // 2. Query VN-WHOIS & RDAP in browser
+  // 2. Query VN-WHOIS (with CORS-safe relays) & RDAP in browser
   if (domainEntry.check_domain !== false) {
     let foundWhois = false;
+    const inetUrl = `https://whois.inet.vn/api/whois/domainspecify/${encodeURIComponent(rootDomain)}`;
+    const paUrl = `https://whois.pavietnam.vn/whois.php?domain=${encodeURIComponent(rootDomain)}&cmd=get_whois`;
 
-    try {
-      const vnResp = await fetch(`https://whois.inet.vn/api/whois/domainspecify/${encodeURIComponent(rootDomain)}`);
-      if (vnResp.ok) {
-        const vnData = await vnResp.json();
-        const expDate = parseFlexibleDate(
-          vnData.expirationDate || vnData.expireDate || vnData.expiration_date
-        );
-        const regDate = parseFlexibleDate(
-          vnData.creationDate || vnData.createDate || vnData.creation_date
-        );
-        if (expDate) {
-          const daysLeft = Math.floor((expDate.getTime() - Date.now()) / 86400000);
-          const nsList = Array.isArray(vnData.nameServer)
-            ? vnData.nameServer.map((n) => String(n).toLowerCase())
-            : item.domain_nameservers || [];
+    const candidateGateways = [
+      inetUrl,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(inetUrl)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${inetUrl}`,
+      `https://corsproxy.io/?${encodeURIComponent(inetUrl)}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(paUrl)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${paUrl}`,
+    ];
+
+    for (const gwUrl of candidateGateways) {
+      try {
+        const resp = await fetch(gwUrl);
+        if (!resp.ok) continue;
+        const rawText = await resp.text();
+        const parsed = parseVnWhoisPayloadInBrowser(rawText, item.domain_nameservers || []);
+        if (parsed && parsed.expDate) {
+          const daysLeft = Math.floor((parsed.expDate.getTime() - Date.now()) / 86400000);
+          const expIso = parsed.expDate.toISOString().slice(0, 10);
+          const regIso = parsed.regDate ? parsed.regDate.toISOString().slice(0, 10) : null;
+          const normReg = normalizeRegistrar(parsed.registrar, parsed.nsList) || "VNNIC Verified";
+
           item.domain_days_left = daysLeft;
-          item.domain_expiry_date = expDate.toISOString().slice(0, 10);
-          item.domain_creation_date = regDate ? regDate.toISOString().slice(0, 10) : null;
-          item.domain_registrar =
-            normalizeRegistrar(vnData.registrar || vnData.registrarName, nsList) || "VNNIC Verified";
-          item.domain_nameservers = nsList.slice(0, 6);
+          item.domain_expiry_date = expIso;
+          item.domain_creation_date = regIso;
+          item.domain_registrar = normReg;
+          item.domain_nameservers = (parsed.nsList || []).slice(0, 6);
           item.domain_source = "VNNIC / VN-WHOIS";
           item.domain_error = null;
           item.domain_status = classifyStatus(
@@ -382,10 +489,18 @@ async function performBrowserLiveCheck(domainEntry) {
             state.domainsConfig.settings.alert_days_domain || 30,
             state.domainsConfig.settings.critical_days_domain || 14
           );
+
+          if (domainEntry.cached_domain_expiry !== expIso || domainEntry.cached_registrar !== normReg) {
+            domainEntry.cached_domain_expiry = expIso;
+            domainEntry.cached_creation_date = regIso || "";
+            domainEntry.cached_registrar = normReg;
+            cacheChanged = true;
+          }
           foundWhois = true;
+          break;
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
 
     if (!foundWhois && !rootDomain.endsWith(".vn")) {
       try {
@@ -444,6 +559,7 @@ async function performBrowserLiveCheck(domainEntry) {
       item.domain_days_left = daysLeft;
       item.domain_expiry_date = domainEntry.custom_domain_expiry;
       item.domain_registrar = item.domain_registrar || "Cấu hình thủ công";
+      item.domain_error = null;
       item.domain_status = classifyStatus(
         daysLeft,
         state.domainsConfig.settings.alert_days_domain || 30,
@@ -455,6 +571,7 @@ async function performBrowserLiveCheck(domainEntry) {
   item.overall_status = computeOverallStatus(item.ssl_status, item.domain_status);
   recalculateSummary();
   renderAll();
+  return cacheChanged;
 }
 
 // GitHub API Helpers (with Anti-409 Conflict Queue & Retry)
@@ -487,24 +604,28 @@ async function githubGetFile(path) {
 
 let saveQueuePromise = Promise.resolve();
 
-function saveDomainsConfig(commitMessage) {
+function saveDomainsConfig(commitMessage, silent = false) {
   saveQueuePromise = saveQueuePromise
     .catch(() => {})
-    .then(() => performSaveDomainsConfig(commitMessage));
+    .then(() => performSaveDomainsConfig(commitMessage, silent));
   return saveQueuePromise;
 }
 
-async function performSaveDomainsConfig(commitMessage) {
+async function performSaveDomainsConfig(commitMessage, silent = false) {
   if (!state.ghConfig.token) {
     localStorage.setItem(STORAGE_KEYS.LOCAL_DOMAINS, JSON.stringify(state.domainsConfig));
     localStorage.setItem(STORAGE_KEYS.LOCAL_RESULTS, JSON.stringify(state.resultsData));
-    showBanner(
-      "💡 Đã lưu tạm trên trình duyệt và tra cứu trực tiếp! Để lưu vĩnh viễn lên GitHub & quét SSL tự động + gửi Email, hãy bấm <strong>⚙️ Cấu hình & Email</strong> để gắn GitHub Token."
-    );
+    if (!silent) {
+      showBanner(
+        "💡 Đã lưu tạm trên trình duyệt và tra cứu trực tiếp! Để lưu vĩnh viễn lên GitHub & quét SSL tự động + gửi Email, hãy bấm <strong>⚙️ Cấu hình & Email</strong> để gắn GitHub Token."
+      );
+    }
     return;
   }
 
-  showBanner("⏳ Đang đồng bộ danh sách tên miền lên GitHub Repository...");
+  if (!silent) {
+    showBanner("⏳ Đang đồng bộ danh sách tên miền lên GitHub Repository...");
+  }
   let sha = state.domainsSha || undefined;
   try {
     const existing = await githubGetFile("data/domains.json");
@@ -554,9 +675,11 @@ async function performSaveDomainsConfig(commitMessage) {
     }
   }
 
-  showBanner(
-    "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & WHOIS ngầm (sẽ cập nhật sau ~30 giây)..."
-  );
+  if (!silent) {
+    showBanner(
+      "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & WHOIS ngầm (sẽ cập nhật sau ~30 giây)..."
+    );
+  }
   scheduleAutoRefreshAfterAction();
 }
 
@@ -990,7 +1113,6 @@ document.addEventListener("DOMContentLoaded", () => {
   initGitHubConfig();
   loadAllData();
 
-  // Sidebar Toggle
   document.getElementById("btnToggleSidebar").addEventListener("click", () => {
     const layout = document.getElementById("appLayout");
     if (window.innerWidth <= 860) {
@@ -1000,13 +1122,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Theme Toggle
   document.getElementById("btnThemeToggle").addEventListener("click", () => {
     const isDark = document.body.classList.contains("dark-theme");
     applyTheme(isDark ? "light" : "dark");
   });
 
-  // Sidebar Filter Navigation Items
   document.querySelectorAll("[data-nav-filter]").forEach((li) => {
     li.addEventListener("click", (e) => {
       e.preventDefault();
@@ -1020,14 +1140,12 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Notification Bell -> Filter Attention
   document.getElementById("btnBellAlert").addEventListener("click", () => {
     document.getElementById("filterStatus").value = "attention";
     setSidebarActiveFilter("attention");
     renderTable();
   });
 
-  // Reset Filter Button (DashStack signature)
   document.getElementById("btnResetFilter").addEventListener("click", () => {
     document.getElementById("searchInput").value = "";
     document.getElementById("filterStatus").value = "all";
@@ -1037,14 +1155,12 @@ document.addEventListener("DOMContentLoaded", () => {
     renderTable();
   });
 
-  // Close buttons for modals
   document.querySelectorAll("[data-close]").forEach((btn) => {
     btn.addEventListener("click", () => closeModal(btn.getAttribute("data-close")));
   });
 
   document.getElementById("statusBannerClose").addEventListener("click", hideBanner);
 
-  // KPI Card Quick Filters
   document.querySelectorAll(".ds-stat-card").forEach((card) => {
     card.addEventListener("click", () => {
       const f = card.getAttribute("data-filter");
@@ -1057,7 +1173,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // Search & Filter inputs
   document.getElementById("searchInput").addEventListener("input", renderTable);
   document.getElementById("filterStatus").addEventListener("change", (e) => {
     setSidebarActiveFilter(e.target.value);
@@ -1066,14 +1181,12 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("filterGroup").addEventListener("change", renderTable);
   document.getElementById("sortBy").addEventListener("change", renderTable);
 
-  // Export CSV
   document.getElementById("btnExportCsv").addEventListener("click", exportToCsv);
   document.getElementById("sideBtnExportCsv").addEventListener("click", (e) => {
     e.preventDefault();
     exportToCsv();
   });
 
-  // Open Add Domain Modal
   const openAddDomainFn = (e) => {
     if (e) e.preventDefault();
     document.getElementById("modalDomainTitle").textContent = "➕ Thêm Tên miền theo dõi";
@@ -1087,7 +1200,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btnAddDomain").addEventListener("click", openAddDomainFn);
   document.getElementById("sideBtnAddDomain").addEventListener("click", openAddDomainFn);
 
-  // Submit Add / Edit Domain Form
   document.getElementById("formDomain").addEventListener("submit", async (e) => {
     e.preventDefault();
     const idVal = document.getElementById("domainId").value;
@@ -1109,8 +1221,17 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
+    const list = state.domainsConfig.domains || [];
+    const existingIdx = list.findIndex(
+      (d) =>
+        (idVal && d.id === idVal) ||
+        (cleanHostname(d.domain) === host && Number(d.port || 443) === port)
+    );
+    const prevEntry = existingIdx >= 0 ? list[existingIdx] : {};
+
     const newEntry = {
-      id: idVal || `dom-${Date.now()}`,
+      ...prevEntry,
+      id: idVal || prevEntry.id || `dom-${Date.now()}`,
       domain: host,
       port,
       group,
@@ -1120,13 +1241,6 @@ document.addEventListener("DOMContentLoaded", () => {
       notify_emails: notifyEmails,
       custom_domain_expiry: customExpiry,
     };
-
-    const list = state.domainsConfig.domains || [];
-    const existingIdx = list.findIndex(
-      (d) =>
-        (idVal && d.id === idVal) ||
-        (cleanHostname(d.domain) === host && Number(d.port || 443) === port)
-    );
 
     if (existingIdx >= 0) {
       list[existingIdx] = newEntry;
@@ -1139,7 +1253,7 @@ document.addEventListener("DOMContentLoaded", () => {
     mergeConfigIntoResults();
     renderAll();
 
-    performBrowserLiveCheck(newEntry);
+    await performBrowserLiveCheck(newEntry);
 
     try {
       await saveDomainsConfig(`chore(monitor): cập nhật domain ${host}:${port}`);
@@ -1148,7 +1262,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Bulk Import Modal
   const openBulkFn = (e) => {
     if (e) e.preventDefault();
     document.getElementById("bulkTextarea").value = "";
@@ -1210,7 +1323,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
     mergeConfigIntoResults();
     renderAll();
-    addedEntries.forEach((ent) => performBrowserLiveCheck(ent));
+    for (const ent of addedEntries) {
+      await performBrowserLiveCheck(ent);
+    }
 
     try {
       await saveDomainsConfig(`chore(monitor): thêm hàng loạt ${addedEntries.length} domain`);
@@ -1219,7 +1334,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Open Settings Modal
   const openSettingsFn = (e) => {
     if (e) e.preventDefault();
     document.getElementById("cfgGhOwner").value = state.ghConfig.owner || "duongnvd";
@@ -1244,7 +1358,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("profileTrigger").addEventListener("click", openSettingsFn);
   document.getElementById("linkOpenSetupGuide").addEventListener("click", openSettingsFn);
 
-  // Save Settings Form
   document.getElementById("formSettings").addEventListener("submit", async (e) => {
     e.preventDefault();
     state.ghConfig = {
@@ -1279,7 +1392,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Run Check Now & Test Email Buttons
   const runScanFn = (e) => {
     if (e) e.preventDefault();
     triggerWorkflowDispatch(false, false);
