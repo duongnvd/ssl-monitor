@@ -46,7 +46,7 @@
     {
       "id": "dom-1793174470570",
       "domain": "vtimgroup.vn",
-      "port": 443,
+      "port": 5555,
       "group": "Default",
       "notes": "",
       "check_ssl": true,
