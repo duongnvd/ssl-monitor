@@ -11,17 +11,6 @@
   },
   "domains": [
     {
-      "id": "dom-2",
-      "domain": "google.com",
-      "port": 443,
-      "group": "External",
-      "notes": "DNS & Search",
-      "check_ssl": true,
-      "check_domain": true,
-      "notify_emails": [],
-      "custom_domain_expiry": ""
-    },
-    {
       "id": "dom-1793174470570",
       "domain": "vtimgroup.vn",
       "port": 5555,
