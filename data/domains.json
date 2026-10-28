@@ -64,6 +64,17 @@
       "check_domain": true,
       "notify_emails": [],
       "custom_domain_expiry": ""
+    },
+    {
+      "id": "dom-1793173232315",
+      "domain": "vtimgroup.vn",
+      "port": 443,
+      "group": "Default",
+      "notes": "",
+      "check_ssl": true,
+      "check_domain": true,
+      "notify_emails": [],
+      "custom_domain_expiry": ""
     }
   ]
 }
