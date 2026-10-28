@@ -1,5 +1,9 @@
 {
+<<<<<<< HEAD
   "last_updated": "2026-10-28T08:28:56Z",
+=======
+  "last_updated": "2026-10-28T08:38:00Z",
+>>>>>>> 8c7849b (feat(vnnic): lay truc tiep WHOIS tu vnnic.vn/whois-information kem giai ma CAPTCHA tu dong)
   "summary": {
     "total": 4,
     "healthy": 4,
@@ -51,6 +55,7 @@
       "domain_expiry_date": "2028-10-09",
       "domain_creation_date": "2007-10-09",
       "domain_registrar": "MarkMonitor Inc.",
+      "domain_registrant": null,
       "domain_nameservers": [
         "dns1.p08.nsone.net",
         "dns2.p08.nsone.net",
@@ -101,6 +106,7 @@
       "domain_expiry_date": "2033-02-17",
       "domain_creation_date": "2009-02-17",
       "domain_registrar": "Cloudflare, Inc.",
+      "domain_registrant": null,
       "domain_nameservers": [
         "ns3.cloudflare.com",
         "ns4.cloudflare.com",
@@ -160,6 +166,7 @@
       "domain_expiry_date": "2028-09-14",
       "domain_creation_date": "1997-09-15",
       "domain_registrar": "MarkMonitor Inc.",
+      "domain_registrant": null,
       "domain_nameservers": [
         "ns1.google.com",
         "ns2.google.com",
@@ -199,17 +206,18 @@
       "ssl_error": null,
       "domain_checked": true,
       "domain_root": "vtimgroup.vn",
-      "domain_status": "unknown",
-      "domain_days_left": null,
-      "domain_expiry_date": null,
-      "domain_creation_date": null,
-      "domain_registrar": "Mắt Bão (Theo Nameserver)",
+      "domain_status": "ok",
+      "domain_days_left": 261,
+      "domain_expiry_date": "2027-07-16",
+      "domain_creation_date": "2024-07-16",
+      "domain_registrar": "Công ty Cổ phần Mắt Bão",
+      "domain_registrant": "Công ty Cổ Phần Đầu Tư Y Tế Vạn Thành",
       "domain_nameservers": [
         "ns2.matbao.vn",
         "ns1.matbao.vn"
       ],
-      "domain_source": null,
-      "domain_error": "Không lấy được ngày hết hạn tự động từ Registry (có thể điền ngày hết hạn thủ công trên giao diện)",
+      "domain_source": "VNNIC (vnnic.vn/whois-information)",
+      "domain_error": null,
       "overall_status": "ok"
     }
   ]

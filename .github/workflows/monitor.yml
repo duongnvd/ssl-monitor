@@ -60,11 +60,12 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install system whois & Python dependencies
+      - name: Install system whois, Tesseract OCR & Python dependencies
         run: |
-          sudo apt-get update -y && sudo apt-get install -y whois dnsutils
+          sudo apt-get update -y && sudo apt-get install -y whois dnsutils tesseract-ocr
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install ddddocr || true
 
       - name: Run SSL & Domain Scanner + Groupware Email Alerter
         env:

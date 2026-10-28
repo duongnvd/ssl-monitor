@@ -3,11 +3,14 @@
 SSL & Domain Expiration Monitor for Sysadmins
 Scans domains from data/domains.json, writes results to data/results.json,
 and sends HTML email notifications via Corporate Groupware SMTP / Gmail SMTP.
+Supports direct lookup from VNNIC (https://vnnic.vn/whois-information/) with automatic CAPTCHA OCR.
 """
 
 import argparse
 import concurrent.futures
 import datetime
+import html as pyhtml
+import io
 import json
 import os
 import re
@@ -22,6 +25,7 @@ import urllib.parse
 import urllib.request
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +50,26 @@ try:
 except ImportError:
     HAS_PYWHOIS = False
 
+try:
+    from PIL import Image, ImageOps
+    if not hasattr(Image, "ANTIALIAS"):
+        Image.ANTIALIAS = Image.LANCZOS  # Compatibility shim for ddddocr on Pillow 10+
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    import ddddocr
+    HAS_DDDDOCR = True
+except ImportError:
+    HAS_DDDDOCR = False
+
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOMAINS_FILE = BASE_DIR / "data" / "domains.json"
@@ -53,6 +77,8 @@ RESULTS_FILE = BASE_DIR / "data" / "results.json"
 
 DEFAULT_BKNS_DEMO_KEY = "bkns_dmo_2376da23bd44858c8390aeeb93065404d21ede1ba2c5d59c0cffc33d6e83c2dd"
 _BKNS_LOCK = threading.Lock()
+_OCR_LOCK = threading.Lock()
+_DDDDOCR_INSTANCE: Any = None
 
 MULTI_PART_TLDS = {
     "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn", "int.vn", "ac.vn",
@@ -116,7 +142,7 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
     if isinstance(val, datetime.date):
         return datetime.datetime(val.year, val.month, val.day, tzinfo=datetime.timezone.utc)
     if isinstance(val, str):
-        s = val.strip()
+        s = pyhtml.unescape(val).replace("\xa0", " ").strip()
         if not s:
             return None
         if s.isdigit() and len(s) >= 10:
@@ -155,14 +181,14 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
             except ValueError:
                 continue
 
-        m_dmy = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})\b", s)
+        m_dmy = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2}|19\d{2})\b", s)
         if m_dmy:
             try:
                 d, m, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
                 return datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc)
             except ValueError:
                 pass
-        m_ymd = re.search(r"\b(20\d{2}|19\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", s)
+        m_ymd = re.search(r"\b(20\d{2}|19\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", s)
         if m_ymd:
             try:
                 y, m, d = int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))
@@ -542,16 +568,22 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
 
 
 def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
-    """Parse either JSON or HTML/text from Vietnamese WHOIS gateways (BKNS, iNET, PA Vietnam)."""
+    """
+    Parse JSON or HTML/text from VNNIC (https://vnnic.vn/whois-information/),
+    Mắt Bão (whois.net.vn), BKNS, iNET, or P.A Việt Nam.
+    """
     if not raw_payload or not raw_payload.strip():
         return None
 
+    # 1. Try JSON format first
     try:
         data = json.loads(raw_payload)
         if isinstance(data, dict) and isinstance(data.get("contents"), str):
             data = json.loads(data["contents"])
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
             data = data["data"]
+        if isinstance(data, dict) and isinstance(data.get("whois_data"), dict):
+            data = {**data, **data["whois_data"]}
         if isinstance(data, dict):
             reg_obj = data.get("registration") if isinstance(data.get("registration"), dict) else {}
             exp_raw = (
@@ -564,6 +596,8 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
                 or data.get("expiredDate")
                 or data.get("expiresAt")
                 or data.get("expires_at")
+                or data.get("ngày_hết_hạn")
+                or data.get("ngay_het_han")
                 or reg_obj.get("expires_at")
             )
             reg_raw = (
@@ -573,14 +607,25 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
                 or data.get("createdDate")
                 or data.get("issueDate")
                 or data.get("registeredAt")
+                or data.get("registeredDate")
+                or data.get("ngày_đăng_ký")
+                or data.get("ngay_dang_ky")
                 or reg_obj.get("created_at")
             )
             exp_date = parse_any_date(exp_raw)
             reg_date = parse_any_date(reg_raw)
             registrar = (
-                data.get("registrar")
+                (data.get("registrar", {}).get("name") if isinstance(data.get("registrar"), dict) else data.get("registrar"))
                 or data.get("registrarName")
+                or data.get("nhà_đăng_ký_quản_lý")
                 or reg_obj.get("registrar")
+            )
+            registrant = (
+                data.get("registrant")
+                or data.get("registrantName")
+                or data.get("owner")
+                or data.get("subcriber")
+                or data.get("tên_chủ_thể_đăng_ký_sử_dụng")
             )
 
             raw_ns = (
@@ -588,6 +633,7 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
                 or data.get("nameServer")
                 or data.get("nameservers")
                 or data.get("name_servers")
+                or data.get("DNS")
                 or []
             )
             if isinstance(raw_ns, str):
@@ -597,7 +643,7 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
             raw_text = str(data.get("rawtext") or data.get("rawText") or data.get("raw") or "")
             if not exp_date and raw_text:
                 m = re.search(
-                    r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*[:\-]?\s*([^\r\n]+)",
+                    r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})",
                     raw_text,
                     re.IGNORECASE,
                 )
@@ -605,7 +651,7 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
                     exp_date = parse_any_date(m.group(1).strip())
             if not reg_date and raw_text:
                 m = re.search(
-                    r"(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)",
+                    r"(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})",
                     raw_text,
                     re.IGNORECASE,
                 )
@@ -613,7 +659,7 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
                     reg_date = parse_any_date(m.group(1).strip())
             if not registrar and raw_text:
                 m = re.search(
-                    r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)",
+                    r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)[\s:\-]*([^\r\n]+)",
                     raw_text,
                     re.IGNORECASE,
                 )
@@ -625,51 +671,269 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
                     "expiry_date": exp_date,
                     "creation_date": reg_date,
                     "registrar": normalize_registrar_name(str(registrar) if registrar else None, nameservers),
+                    "registrant": str(registrant).strip() if registrant else None,
                     "nameservers": nameservers,
                     "source": "VNNIC / VN-WHOIS",
                 }
     except Exception:
         pass
 
-    clean_txt = re.sub(r"<[^>]+>", "\n", raw_payload)
+    # 2. Parse HTML / Table / Plain text (such as https://vnnic.vn/whois-information/ or whois.net.vn)
+    cleaned_html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw_payload, flags=re.IGNORECASE | re.DOTALL)
+    unescaped = pyhtml.unescape(cleaned_html).replace("\xa0", " ").replace("&nbsp;", " ")
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in re.sub(r"<[^>]+>", "\n", unescaped).splitlines()]
+    clean_txt = "\n".join(ln for ln in lines if ln)
+
     exp_date = None
-    for pat in [
-        r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn)\s*[:\-]?\s*([^\r\n]+)",
-    ]:
-        m = re.search(pat, clean_txt, re.IGNORECASE)
-        if m:
-            exp_date = parse_any_date(m.group(1).strip())
-            if exp_date:
-                break
+    m_exp = re.search(
+        r"(?:Ngày hết hạn|Expiration Date|Expiry Date|Expired Date|paid-till)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})",
+        clean_txt,
+        re.IGNORECASE,
+    )
+    if m_exp:
+        exp_date = parse_any_date(m_exp.group(1).strip())
     if not exp_date:
         return None
 
     reg_date = None
-    for pat in [
-        r"(?:Creation Date|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)",
-    ]:
-        m = re.search(pat, clean_txt, re.IGNORECASE)
-        if m:
-            reg_date = parse_any_date(m.group(1).strip())
-            if reg_date:
-                break
+    m_reg_dt = re.search(
+        r"(?:Ngày đăng ký|Ngày cấp|Creation Date|Created On|Issue Date)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})",
+        clean_txt,
+        re.IGNORECASE,
+    )
+    if m_reg_dt:
+        reg_date = parse_any_date(m_reg_dt.group(1).strip())
 
     registrar = None
-    for pat in [
-        r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)",
-    ]:
-        m = re.search(pat, clean_txt, re.IGNORECASE)
-        if m:
-            registrar = m.group(1).strip()
-            break
+    m_registrar = re.search(
+        r"(?:Nhà đăng ký quản lý|Nhà đăng ký|Registrar Name|Registrar)[\s:\-]*([^\r\n]+)",
+        clean_txt,
+        re.IGNORECASE,
+    )
+    if m_registrar:
+        registrar = m_registrar.group(1).strip()
+
+    registrant = None
+    m_registrant = re.search(
+        r"(?:Tên chủ thể đăng ký sử dụng|Chủ thể đăng ký|Chủ sở hữu|Registrant Organization|Registrant Name|Registrant)[\s:\-]*([^\r\n]+)",
+        clean_txt,
+        re.IGNORECASE,
+    )
+    if m_registrant:
+        registrant = m_registrant.group(1).strip()
+
+    nameservers: List[str] = []
+    m_dns = re.search(
+        r"(?:Máy chủ DNS chuyển giao|Name Server|Nameservers|DNS)[\s:\-]*(.+?)(?:DNSSEC|Trạng thái|Status|Từ khóa tìm kiếm|$)",
+        clean_txt,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_dns:
+        ns_candidates = re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", m_dns.group(1).lower())
+        nameservers = list(dict.fromkeys([ns.rstrip(".") for ns in ns_candidates]))[:6]
 
     return {
         "expiry_date": exp_date,
         "creation_date": reg_date,
-        "registrar": normalize_registrar_name(registrar, []),
-        "nameservers": [],
-        "source": "VN-WHOIS",
+        "registrar": normalize_registrar_name(registrar, nameservers),
+        "registrant": registrant,
+        "nameservers": nameservers,
+        "source": "VNNIC (vnnic.vn/whois-information)",
     }
+
+
+class _VnnicFormParser(HTMLParser):
+    """Extracts Drupal WHOIS search form, hidden tokens, and CAPTCHA image URL from vnnic.vn/whois-information."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forms: List[Dict[str, Any]] = []
+        self._current_form: Optional[Dict[str, Any]] = None
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attr_dict = {k.lower(): (v or "") for k, v in attrs}
+        t = tag.lower()
+        if t == "form":
+            self._current_form = {
+                "action": attr_dict.get("action", ""),
+                "method": attr_dict.get("method", "post").lower(),
+                "id": attr_dict.get("id", ""),
+                "inputs": [],
+                "images": [],
+            }
+            self.forms.append(self._current_form)
+        elif self._current_form is not None:
+            if t in ("input", "button"):
+                self._current_form["inputs"].append(attr_dict)
+            elif t == "img" and attr_dict.get("src"):
+                self._current_form["images"].append(attr_dict["src"])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "form":
+            self._current_form = None
+
+
+def solve_vnnic_captcha(img_bytes: bytes, prefer_tesseract: bool = False) -> str:
+    """
+    Solves the 3-character simple image CAPTCHA on https://vnnic.vn/whois-information/
+    using ddddocr and/or pytesseract.
+    """
+    global _DDDDOCR_INSTANCE
+    if not img_bytes:
+        return ""
+
+    # 1. Try ddddocr (deep learning OCR specialized for simple CAPTCHAs)
+    if HAS_DDDDOCR and not prefer_tesseract:
+        with _OCR_LOCK:
+            try:
+                if _DDDDOCR_INSTANCE is None:
+                    _DDDDOCR_INSTANCE = ddddocr.DdddOcr(show_ad=False)
+                raw_code = _DDDDOCR_INSTANCE.classification(img_bytes)
+                code = re.sub(r"[^A-Za-z0-9]", "", str(raw_code or ""))
+                if 2 <= len(code) <= 6:
+                    return code
+            except Exception:
+                pass
+
+    # 2. Try pytesseract with Pillow preprocessing (3x upscale + binary threshold)
+    if HAS_PIL and HAS_TESSERACT:
+        try:
+            img = Image.open(io.BytesIO(img_bytes)).convert("L")
+            img = ImageOps.expand(img, border=16, fill=255)
+            w, h = img.size
+            img = img.resize((w * 3, h * 3), Image.LANCZOS)
+            img = ImageOps.autocontrast(img)
+            bw = img.point(lambda p: 0 if p < 155 else 255, "1")
+            for psm in ("8", "7"):
+                cfg = f"--psm {psm} -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                txt = pytesseract.image_to_string(bw, config=cfg)
+                code = re.sub(r"[^A-Za-z0-9]", "", txt or "")
+                if 2 <= len(code) <= 6:
+                    return code
+        except Exception:
+            pass
+
+    return ""
+
+
+def query_vnnic_portal_whois(root_domain: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    """
+    Directly queries https://vnnic.vn/whois-information/ (Trung tâm Internet Việt Nam - VNNIC),
+    automatically solving its 3-character image CAPTCHA and parsing the official Vietnamese WHOIS table.
+    """
+    if not HAS_REQUESTS:
+        return None
+
+    portal_urls = [
+        "https://vnnic.vn/whois-information",
+        "https://vnnic.vn/vi/whois-information",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    session = pyrequests.Session()
+    session.headers.update(headers)
+
+    for base_url in portal_urls:
+        try:
+            resp = session.get(base_url, timeout=timeout)
+            if resp.status_code != 200 or not resp.text:
+                continue
+
+            current_html = resp.text
+            current_url = resp.url or base_url
+
+            # Check if result is already present without CAPTCHA
+            direct_parsed = parse_vn_whois_payload(current_html)
+            if direct_parsed and direct_parsed.get("expiry_date"):
+                return direct_parsed
+
+            # Attempt up to 5 times to solve the 3-character CAPTCHA and submit the form
+            for attempt in range(5):
+                parser = _VnnicFormParser()
+                parser.feed(current_html)
+
+                target_form = None
+                for frm in parser.forms:
+                    has_captcha = any("captcha" in (inp.get("name") or "").lower() for inp in frm["inputs"]) or any(
+                        "captcha" in src.lower() for src in frm["images"]
+                    )
+                    if has_captcha or "whois" in frm.get("id", "").lower() or "whois" in frm.get("action", "").lower():
+                        target_form = frm
+                        break
+
+                if not target_form:
+                    break
+
+                form_data: Dict[str, str] = {}
+                domain_field_name: Optional[str] = None
+                captcha_field_name: str = "captcha_response"
+                submit_added = False
+
+                for inp in target_form["inputs"]:
+                    itype = (inp.get("type") or "text").lower()
+                    iname = inp.get("name") or ""
+                    ival = inp.get("value") or ""
+                    if not iname:
+                        continue
+                    if itype == "hidden":
+                        form_data[iname] = ival
+                    elif itype == "submit":
+                        if not submit_added:
+                            form_data[iname] = ival or "Tìm kiếm"
+                            submit_added = True
+                    elif itype in ("text", "search", ""):
+                        if "captcha" in iname.lower():
+                            captcha_field_name = iname
+                        elif domain_field_name is None:
+                            domain_field_name = iname
+
+                if not domain_field_name:
+                    domain_field_name = "key"
+
+                form_data[domain_field_name] = root_domain
+
+                captcha_img_src = None
+                for src in target_form["images"]:
+                    if "captcha" in src.lower():
+                        captcha_img_src = src
+                        break
+                if not captcha_img_src and target_form["images"]:
+                    captcha_img_src = target_form["images"][0]
+
+                if captcha_img_src:
+                    captcha_url = urllib.parse.urljoin(current_url, captcha_img_src)
+                    img_resp = session.get(captcha_url, headers={"Referer": current_url}, timeout=timeout)
+                    if img_resp.status_code == 200 and img_resp.content:
+                        code = solve_vnnic_captcha(img_resp.content, prefer_tesseract=(attempt % 2 == 1))
+                        if not code:
+                            continue
+                        form_data[captcha_field_name] = code
+
+                action_url = urllib.parse.urljoin(current_url, target_form["action"] or current_url)
+                if target_form["method"] == "get":
+                    post_resp = session.get(action_url, params=form_data, headers={"Referer": current_url}, timeout=timeout)
+                else:
+                    post_resp = session.post(action_url, data=form_data, headers={"Referer": current_url}, timeout=timeout)
+
+                if post_resp.status_code != 200 or not post_resp.text:
+                    break
+
+                parsed = parse_vn_whois_payload(post_resp.text)
+                if parsed and parsed.get("expiry_date"):
+                    parsed["source"] = "VNNIC (vnnic.vn/whois-information)"
+                    return parsed
+
+                # Use the reloaded form & fresh CAPTCHA from post_resp.text for the next retry
+                current_html = post_resp.text
+                current_url = post_resp.url or action_url
+        except Exception:
+            continue
+
+    return None
 
 
 def query_bkns_vn_whois(root_domain: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
@@ -714,33 +978,35 @@ def query_bkns_vn_whois(root_domain: str, timeout: int = 8) -> Optional[Dict[str
     return None
 
 
-def query_vn_registrar_whois(root_domain: str, timeout: int = 6) -> Optional[Dict[str, Any]]:
+def query_vn_registrar_whois(root_domain: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
     """
-    Query Vietnamese accredited VNNIC registrar WHOIS gateways across multiple direct
-    and relay endpoints so even US GitHub Actions runners can resolve .vn domains reliably.
+    Query VNNIC (https://vnnic.vn/whois-information/) first, followed by Mắt Bão (whois.net.vn),
+    BKNS VNNIC API, iNET, and P.A Việt Nam.
     """
-    # 1. Try BKNS Official VNNIC REST API first (works globally including GitHub Actions US IPs)
-    bkns_res = query_bkns_vn_whois(root_domain, timeout=timeout)
-    if bkns_res and bkns_res.get("expiry_date"):
-        return bkns_res
+    # 1. Try Official VNNIC Portal (https://vnnic.vn/whois-information/) with automatic CAPTCHA OCR
+    vnnic_res = query_vnnic_portal_whois(root_domain, timeout=timeout)
+    if vnnic_res and vnnic_res.get("expiry_date"):
+        return vnnic_res
 
-    # 2. Try iNET & PA Vietnam gateways (direct + proxies)
+    # 2. Try Mắt Bão (whois.net.vn), iNET, and PA Vietnam gateways
+    matbao_url = f"http://www.whois.net.vn/whois.php?domain={urllib.parse.quote(root_domain)}&act=getwhois"
     inet_url = f"https://whois.inet.vn/api/whois/domainspecify/{urllib.parse.quote(root_domain)}"
     pa_url = f"https://whois.pavietnam.vn/whois.php?domain={urllib.parse.quote(root_domain)}&cmd=get_whois"
 
     candidate_urls = [
+        matbao_url,
+        f"https://api.allorigins.win/raw?url={urllib.parse.quote(matbao_url, safe='')}",
+        f"https://api.codetabs.com/v1/proxy?quest={matbao_url}",
         inet_url,
         f"https://api.allorigins.win/raw?url={urllib.parse.quote(inet_url, safe='')}",
         f"https://api.codetabs.com/v1/proxy?quest={inet_url}",
-        f"https://corsproxy.io/?{urllib.parse.quote(inet_url, safe='')}",
         pa_url,
         f"https://api.allorigins.win/raw?url={urllib.parse.quote(pa_url, safe='')}",
     ]
 
     headers = {
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json, text/html, text/plain, */*",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Referer": "https://whois.inet.vn/",
     }
 
     for url in candidate_urls:
@@ -750,6 +1016,11 @@ def query_vn_registrar_whois(root_domain: str, timeout: int = 6) -> Optional[Dic
         parsed = parse_vn_whois_payload(txt)
         if parsed and parsed.get("expiry_date"):
             return parsed
+
+    # 3. Try BKNS Official VNNIC REST API
+    bkns_res = query_bkns_vn_whois(root_domain, timeout=timeout)
+    if bkns_res and bkns_res.get("expiry_date"):
+        return bkns_res
 
     return None
 
@@ -763,8 +1034,8 @@ def check_domain_registration(
     prev_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Checks domain WHOIS / RDAP expiration date, registrar, creation date, and nameservers.
-    Supports .vn domains (Mắt Bão, Tenten, PA, Nhân Hòa, iNET) and international TLDs.
+    Checks domain WHOIS / RDAP expiration date, registrar, registrant, creation date, and nameservers.
+    Supports .vn domains (VNNIC, Mắt Bão, Tenten, PA, Nhân Hòa, iNET) and international TLDs.
     """
     root_domain = extract_root_domain(hostname)
     result: Dict[str, Any] = {
@@ -775,6 +1046,7 @@ def check_domain_registration(
         "domain_expiry_date": None,
         "domain_creation_date": None,
         "domain_registrar": None,
+        "domain_registrant": None,
         "domain_nameservers": [],
         "domain_source": None,
         "domain_error": None,
@@ -783,29 +1055,31 @@ def check_domain_registration(
     exp_dt: Optional[datetime.datetime] = None
     reg_dt: Optional[datetime.datetime] = None
     registrar: Optional[str] = None
+    registrant: Optional[str] = None
     nameservers: List[str] = query_doh_nameservers(root_domain)
     source: Optional[str] = None
 
     # Check if we already have a verified expiry date from previous results (> 45 days left)
-    # to avoid burning rate limits unnecessarily for .vn domains
     if root_domain.endswith(".vn") and prev_result and prev_result.get("domain_expiry_date"):
         prev_exp = parse_any_date(prev_result.get("domain_expiry_date"))
         if prev_exp and (prev_exp - now_utc()).days > 45:
             exp_dt = prev_exp
             reg_dt = parse_any_date(prev_result.get("domain_creation_date"))
             registrar = prev_result.get("domain_registrar")
-            source = prev_result.get("domain_source") or "VNNIC (Cached)"
+            registrant = prev_result.get("domain_registrant")
+            source = prev_result.get("domain_source") or "VNNIC (vnnic.vn/whois-information)"
 
-    # 1. For .vn domains, query VNNIC / Vietnamese Registrar WHOIS API
+    # 1. For .vn domains, query VNNIC (https://vnnic.vn/whois-information/) & Vietnamese Registrar WHOIS
     if exp_dt is None and root_domain.endswith(".vn"):
         vn_info = query_vn_registrar_whois(root_domain)
         if vn_info and vn_info.get("expiry_date"):
             exp_dt = vn_info["expiry_date"]
             reg_dt = vn_info.get("creation_date")
             registrar = vn_info.get("registrar")
+            registrant = vn_info.get("registrant")
             if vn_info.get("nameservers"):
                 nameservers = vn_info["nameservers"]
-            source = vn_info.get("source", "VNNIC WHOIS")
+            source = vn_info.get("source", "VNNIC (vnnic.vn/whois-information)")
 
     # 2. Try RDAP (fast, structured for .com, .net, .org, .io, .dev, etc.)
     if exp_dt is None:
@@ -825,6 +1099,7 @@ def check_domain_registration(
             exp_dt = vn_fallback["expiry_date"]
             reg_dt = vn_fallback.get("creation_date")
             registrar = vn_fallback.get("registrar")
+            registrant = vn_fallback.get("registrant")
             if vn_fallback.get("nameservers"):
                 nameservers = vn_fallback["nameservers"]
             source = vn_fallback.get("source", "VN-WHOIS")
@@ -868,7 +1143,8 @@ def check_domain_registration(
             exp_dt = c_exp
             reg_dt = parse_any_date(cached_info.get("cached_creation_date")) or reg_dt
             registrar = cached_info.get("cached_registrar") or registrar
-            source = "VNNIC (Đồng bộ)"
+            registrant = cached_info.get("cached_registrant") or registrant
+            source = "VNNIC (vnnic.vn/whois-information)"
 
     if exp_dt is None and prev_result and prev_result.get("domain_expiry_date"):
         p_exp = parse_any_date(prev_result.get("domain_expiry_date"))
@@ -876,6 +1152,7 @@ def check_domain_registration(
             exp_dt = p_exp
             reg_dt = parse_any_date(prev_result.get("domain_creation_date")) or reg_dt
             registrar = prev_result.get("domain_registrar") or registrar
+            registrant = prev_result.get("domain_registrant") or registrant
             source = prev_result.get("domain_source") or "Cached"
 
     # 7. Manual override (`custom_domain_expiry` in domains.json)
@@ -887,6 +1164,7 @@ def check_domain_registration(
 
     registrar = normalize_registrar_name(registrar, nameservers)
     result["domain_registrar"] = registrar or "—"
+    result["domain_registrant"] = registrant
     result["domain_nameservers"] = nameservers
 
     if exp_dt is not None:

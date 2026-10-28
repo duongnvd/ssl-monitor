@@ -261,6 +261,9 @@ function mergeConfigIntoResults() {
           if (d.cached_registrar && (!prev.domain_registrar || prev.domain_registrar === "—")) {
             prev.domain_registrar = d.cached_registrar;
           }
+          if (d.cached_registrant && !prev.domain_registrant) {
+            prev.domain_registrant = d.cached_registrant;
+          }
           prev.domain_error = null;
           prev.domain_status = classifyStatus(
             days,
@@ -292,6 +295,7 @@ function mergeConfigIntoResults() {
         domain_days_left: null,
         domain_expiry_date: d.custom_domain_expiry || d.cached_domain_expiry || null,
         domain_registrar: d.cached_registrar || "Đang tra cứu VNNIC / RDAP...",
+        domain_registrant: d.cached_registrant || null,
         overall_status: "unknown",
       });
     }
@@ -320,14 +324,14 @@ function parseFlexibleDate(raw) {
     const d = new Date(ms);
     return isNaN(d.getTime()) ? null : d;
   }
-  const s = String(raw).trim();
+  const s = String(raw).replace(/&nbsp;/gi, " ").trim();
   if (!s) return null;
-  const mDmy = s.match(/(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})/);
+  const mDmy = s.match(/(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2}|19\d{2})/);
   if (mDmy) {
     const d = new Date(Date.UTC(Number(mDmy[3]), Number(mDmy[2]) - 1, Number(mDmy[1])));
     if (!isNaN(d.getTime())) return d;
   }
-  const mYmd = s.match(/(20\d{2}|19\d{2})[-/](\d{1,2})[-/](\d{1,2})/);
+  const mYmd = s.match(/(20\d{2}|19\d{2})[-/.](\d{1,2})[-/.](\d{1,2})/);
   if (mYmd) {
     const d = new Date(Date.UTC(Number(mYmd[1]), Number(mYmd[2]) - 1, Number(mYmd[3])));
     if (!isNaN(d.getTime())) return d;
@@ -371,6 +375,9 @@ function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
     if (data && typeof data === "object" && data.data && typeof data.data === "object") {
       data = data.data;
     }
+    if (data && typeof data === "object" && data.whois_data && typeof data.whois_data === "object") {
+      data = { ...data, ...data.whois_data };
+    }
     if (data && typeof data === "object") {
       const regObj = data.registration && typeof data.registration === "object" ? data.registration : {};
       let expDate = parseFlexibleDate(
@@ -382,6 +389,7 @@ function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
           data.expiredDate ||
           data.expiresAt ||
           data.expires_at ||
+          data.ngày_hết_hạn ||
           regObj.expires_at ||
           regObj.expiration_date
       );
@@ -391,11 +399,20 @@ function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
           data.creation_date ||
           data.issueDate ||
           data.registeredDate ||
+          data.ngày_đăng_ký ||
           regObj.created_at
       );
       let registrar =
         (typeof data.registrar === "object" && data.registrar ? data.registrar.name : data.registrar) ||
         data.registrarName ||
+        data.nhà_đăng_ký_quản_lý ||
+        "";
+      let registrant =
+        data.registrant ||
+        data.registrantName ||
+        data.owner ||
+        data.subcriber ||
+        data.tên_chủ_thể_đăng_ký_sử_dụng ||
         "";
       const rawNs = data.nameServer || data.nameServers || data.nameservers || data.DNS;
       const nsList = Array.isArray(rawNs)
@@ -407,35 +424,59 @@ function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
 
       const raw = String(data.rawtext || data.rawText || data.raw || "");
       if (!expDate && raw) {
-        const m = raw.match(/(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*[:\-]?\s*([^\r\n]+)/i);
+        const m = raw.match(
+          /(?:Ngày hết hạn|Expiration Date|Expiry Date|Expired Date|paid-till)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})/i
+        );
         if (m) expDate = parseFlexibleDate(m[1]);
       }
       if (!regDate && raw) {
-        const m = raw.match(/(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)/i);
+        const m = raw.match(
+          /(?:Ngày đăng ký|Ngày cấp|Creation Date|Created On|Issue Date)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})/i
+        );
         if (m) regDate = parseFlexibleDate(m[1]);
       }
       if (!registrar && raw) {
-        const m = raw.match(/(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)/i);
+        const m = raw.match(/(?:Nhà đăng ký quản lý|Nhà đăng ký|Registrar)[\s:\-]*([^\r\n]+)/i);
         if (m) registrar = m[1].trim();
       }
       if (expDate) {
-        return { expDate, regDate, registrar, nsList: nsList.length ? nsList : fallbackNs };
+        return { expDate, regDate, registrar, registrant, nsList: nsList.length ? nsList : fallbackNs };
       }
     }
   } catch (_) {}
 
-  const clean = String(rawText).replace(/<[^>]+>/g, "\n");
-  const mExp = clean.match(/(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn)\s*[:\-]?\s*([^\r\n]+)/i);
+  // Parse HTML table / text (such as VNNIC vnnic.vn/whois-information, whois.net.vn, whois.pavietnam.vn)
+  const noScript = String(rawText).replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, " ");
+  const cleanLines = noScript
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\u00a0/g, " ")
+    .replace(/<[^>]+>/g, "\n")
+    .split(/\r?\n/)
+    .map((ln) => ln.replace(/[ \t]+/g, " ").trim())
+    .filter(Boolean);
+  const clean = cleanLines.join("\n");
+
+  const mExp = clean.match(
+    /(?:Ngày hết hạn|Expiration Date|Expiry Date|Expired Date|paid-till)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})/i
+  );
   if (!mExp) return null;
   const expDate = parseFlexibleDate(mExp[1]);
   if (!expDate) return null;
 
-  const mReg = clean.match(/(?:Creation Date|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)/i);
+  const mReg = clean.match(
+    /(?:Ngày đăng ký|Ngày cấp|Creation Date|Created On|Issue Date)[\s:\-]*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})/i
+  );
   const regDate = mReg ? parseFlexibleDate(mReg[1]) : null;
-  const mRegistrar = clean.match(/(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)/i);
+
+  const mRegistrar = clean.match(/(?:Nhà đăng ký quản lý|Nhà đăng ký|Registrar Name|Registrar)[\s:\-]*([^\r\n]+)/i);
   const registrar = mRegistrar ? mRegistrar[1].trim() : "";
 
-  return { expDate, regDate, registrar, nsList: fallbackNs };
+  const mRegistrant = clean.match(
+    /(?:Tên chủ thể đăng ký sử dụng|Chủ thể đăng ký|Chủ sở hữu|Registrant Organization|Registrant Name|Registrant)[\s:\-]*([^\r\n]+)/i
+  );
+  const registrant = mRegistrant ? mRegistrant[1].trim() : "";
+
+  return { expDate, regDate, registrar, registrant, nsList: fallbackNs };
 }
 
 async function performBrowserLiveCheck(domainEntry) {
@@ -477,19 +518,21 @@ async function performBrowserLiveCheck(domainEntry) {
     }
   } catch (_) {}
 
-  // 2. Query VNNIC / BKNS / VN-WHOIS & RDAP in browser
+  // 2. Query VNNIC / Mắt Bão (whois.net.vn) / BKNS / VN-WHOIS & RDAP in browser
   if (domainEntry.check_domain !== false) {
     let foundWhois = false;
+    const matbaoUrl = `http://www.whois.net.vn/whois.php?domain=${encodeURIComponent(rootDomain)}&act=getwhois`;
     const bknsUrl = `https://whois.bkns.vn/api/v1/whois?domain=${encodeURIComponent(rootDomain)}`;
     const inetUrl = `https://whois.inet.vn/api/whois/domainspecify/${encodeURIComponent(rootDomain)}`;
     const paUrl = `https://whois.pavietnam.vn/whois.php?domain=${encodeURIComponent(rootDomain)}&cmd=get_whois`;
 
     const candidateRequests = [
+      { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(matbaoUrl)}` },
+      { url: `https://api.codetabs.com/v1/proxy?quest=${matbaoUrl}` },
       { url: bknsUrl, headers: { Accept: "application/json", "X-API-Key": BKNS_DEMO_API_KEY } },
       { url: inetUrl, headers: { Accept: "application/json" } },
       { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(inetUrl)}` },
       { url: `https://api.codetabs.com/v1/proxy?quest=${inetUrl}` },
-      { url: `https://corsproxy.io/?${encodeURIComponent(inetUrl)}` },
       { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(paUrl)}` },
       { url: `https://api.codetabs.com/v1/proxy?quest=${paUrl}` },
     ];
@@ -510,8 +553,9 @@ async function performBrowserLiveCheck(domainEntry) {
           item.domain_expiry_date = expIso;
           item.domain_creation_date = regIso;
           item.domain_registrar = normReg;
+          if (parsed.registrant) item.domain_registrant = parsed.registrant;
           item.domain_nameservers = (parsed.nsList || []).slice(0, 6);
-          item.domain_source = "VNNIC / VN-WHOIS";
+          item.domain_source = "VNNIC (vnnic.vn/whois-information)";
           item.domain_error = null;
           item.domain_status = classifyStatus(
             daysLeft,
@@ -523,6 +567,7 @@ async function performBrowserLiveCheck(domainEntry) {
             domainEntry.cached_domain_expiry = expIso;
             domainEntry.cached_creation_date = regIso || "";
             domainEntry.cached_registrar = normReg;
+            if (parsed.registrant) domainEntry.cached_registrant = parsed.registrant;
             cacheChanged = true;
           }
           foundWhois = true;
@@ -706,7 +751,7 @@ async function performSaveDomainsConfig(commitMessage, silent = false) {
 
   if (!silent) {
     showBanner(
-      "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & VNNIC WHOIS ngầm (sẽ cập nhật sau ~35-60 giây)..."
+      "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & tra cứu VNNIC (vnnic.vn/whois-information) ngầm..."
     );
   }
   scheduleAutoRefreshAfterAction();
@@ -733,7 +778,7 @@ async function triggerWorkflowDispatch(forceEmail = false, testEmail = false) {
     showBanner(
       testEmail
         ? "✉️ Đã kích hoạt gửi Email Test! Vui lòng kiểm tra hộp thư Groupware của bạn sau khoảng 30–45 giây."
-        : "🔄 GitHub Actions đang chạy quét toàn bộ SSL & Domain! Kết quả sẽ tự động làm mới sau ~35-60 giây..."
+        : "🔄 GitHub Actions đang chạy quét SSL & tra cứu VNNIC (vnnic.vn/whois-information)! Kết quả sẽ tự động làm mới sau ~35-60 giây..."
     );
     scheduleAutoRefreshAfterAction();
   } catch (err) {
@@ -855,6 +900,7 @@ function renderTable() {
         it.ssl_ip,
         it.ssl_issuer,
         it.domain_registrar,
+        it.domain_registrant,
       ]
         .filter(Boolean)
         .join(" ")
@@ -967,6 +1013,7 @@ function renderTable() {
             <div class="cell-subinfo">
               <div>${domExpText}</div>
               <div>Registrar: <strong>${escapeHtml(it.domain_registrar || "—")}</strong></div>
+              ${it.domain_registrant ? `<div style="font-size:11px;color:var(--ds-text-muted)">Chủ thể: ${escapeHtml(it.domain_registrant)}</div>` : ""}
             </div>
           </td>
 
@@ -1032,12 +1079,12 @@ window.openDetailModal = function (domain, port) {
         <h4>🌍 Thông tin Tên miền (VNNIC / WHOIS / RDAP)</h4>
         <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.domain_status, it.domain_days_left, isScanned)}</span></div>
         <div class="kv-row"><span class="kv-key">Tên miền gốc (Root):</span><span class="kv-val">${escapeHtml(it.domain_root || extractRootDomain(it.domain))}</span></div>
-        <div class="kv-row"><span class="kv-key">Nhà đăng ký (Registrar):</span><span class="kv-val">${escapeHtml(it.domain_registrar || "—")}</span></div>
+        <div class="kv-row"><span class="kv-key">Tên chủ thể đăng ký:</span><span class="kv-val"><strong>${escapeHtml(it.domain_registrant || "—")}</strong></span></div>
+        <div class="kv-row"><span class="kv-key">Nhà đăng ký quản lý:</span><span class="kv-val">${escapeHtml(it.domain_registrar || "—")}</span></div>
         <div class="kv-row"><span class="kv-key">Ngày đăng ký:</span><span class="kv-val">${escapeHtml(it.domain_creation_date || "—")}</span></div>
-        <div class="kv-row"><span class="kv-key">Ngày hết hạn Domain:</span><span class="kv-val">${escapeHtml(it.domain_expiry_date || "—")}</span></div>
-        <div class="kv-row"><span class="kv-key">Nameservers (DNS):</span><span class="kv-val">${escapeHtml(ns)}</span></div>
-        <div class="kv-row"><span class="kv-key">Nguồn tra cứu:</span><span class="kv-val">${escapeHtml(it.domain_source || "—")}</span></div>
-        <div class="kv-row"><span class="kv-key">Nhóm / Ghi chú:</span><span class="kv-val">${escapeHtml(it.group || "Default")} ${it.notes ? "• " + escapeHtml(it.notes) : ""}</span></div>
+        <div class="kv-row"><span class="kv-key">Ngày hết hạn Domain:</span><span class="kv-val"><strong>${escapeHtml(it.domain_expiry_date || "—")}</strong></span></div>
+        <div class="kv-row"><span class="kv-key">Máy chủ DNS chuyển giao:</span><span class="kv-val">${escapeHtml(ns)}</span></div>
+        <div class="kv-row"><span class="kv-key">Nguồn tra cứu:</span><span class="kv-val">${escapeHtml(it.domain_source || "—")} • <a href="https://vnnic.vn/whois-information/" target="_blank" rel="noopener" style="color:var(--ds-primary)">Mở VNNIC ↗</a></span></div>
         <div class="kv-row"><span class="kv-key">Email nhận cảnh báo:</span><span class="kv-val">${escapeHtml(emails)}</span></div>
       </div>
     </div>
@@ -1100,6 +1147,7 @@ function exportToCsv() {
     "Domain Days Left",
     "Domain Expiry Date",
     "Registrar",
+    "Registrant",
     "Notes",
   ];
   const rows = items.map((it) => [
@@ -1115,6 +1163,7 @@ function exportToCsv() {
     it.domain_days_left ?? "",
     it.domain_expiry_date || "",
     it.domain_registrar || "",
+    it.domain_registrant || "",
     it.notes || "",
   ]);
 

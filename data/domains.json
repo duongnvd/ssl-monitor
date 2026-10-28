@@ -52,7 +52,11 @@
       "check_ssl": true,
       "check_domain": true,
       "notify_emails": [],
-      "custom_domain_expiry": ""
+      "custom_domain_expiry": "",
+      "cached_domain_expiry": "2027-07-16",
+      "cached_creation_date": "2024-07-16",
+      "cached_registrar": "Công ty Cổ phần Mắt Bão",
+      "cached_registrant": "Công ty Cổ Phần Đầu Tư Y Tế Vạn Thành"
     }
   ]
 }
