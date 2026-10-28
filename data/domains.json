@@ -42,6 +42,17 @@
       "check_domain": true,
       "notify_emails": [],
       "custom_domain_expiry": ""
+    },
+    {
+      "id": "dom-1793172526563",
+      "domain": "nhakhoavanthanh.com.vn",
+      "port": 443,
+      "group": "Default",
+      "notes": "",
+      "check_ssl": true,
+      "check_domain": true,
+      "notify_emails": [],
+      "custom_domain_expiry": ""
     }
   ]
 }
