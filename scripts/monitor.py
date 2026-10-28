@@ -15,6 +15,7 @@ import smtplib
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -49,6 +50,9 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOMAINS_FILE = BASE_DIR / "data" / "domains.json"
 RESULTS_FILE = BASE_DIR / "data" / "results.json"
+
+DEFAULT_BKNS_DEMO_KEY = "bkns_dmo_2376da23bd44858c8390aeeb93065404d21ede1ba2c5d59c0cffc33d6e83c2dd"
+_BKNS_LOCK = threading.Lock()
 
 MULTI_PART_TLDS = {
     "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn", "int.vn", "ac.vn",
@@ -151,7 +155,6 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
             except ValueError:
                 continue
 
-        # Regex fallback for DD-MM-YYYY or DD/MM/YYYY or YYYY-MM-DD embedded in text
         m_dmy = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})\b", s)
         if m_dmy:
             try:
@@ -196,7 +199,7 @@ def normalize_registrar_name(registrar: Optional[str], nameservers: Optional[Lis
     return reg or None
 
 
-def http_get_text(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 10) -> Optional[str]:
+def http_get_text(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 8) -> Optional[str]:
     """Fetch URL text using requests (if available) or urllib."""
     hdrs = headers or {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -256,10 +259,7 @@ def check_ssl_certificate(
     crit_days: int = 7,
     timeout: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Connects to hostname:port via TLS, verifies certificate chain, and extracts
-    expiration date, issuer, subject, SANs, protocol, cipher, and IP.
-    """
+    """Connects to hostname:port via TLS and extracts certificate metadata."""
     result: Dict[str, Any] = {
         "ssl_checked": True,
         "ssl_status": "error",
@@ -291,7 +291,6 @@ def check_ssl_certificate(
     der_cert: Optional[bytes] = None
     peer_cert_dict: Optional[Dict[str, Any]] = None
 
-    # Step 1: Try verified connection first
     verified_ctx = ssl.create_default_context()
     try:
         with socket.create_connection((hostname, port), timeout=timeout) as sock:
@@ -311,7 +310,6 @@ def check_ssl_certificate(
         result["ssl_error"] = f"TLS Connection failed: {conn_err}"
         return result
 
-    # Step 2: If verification failed, fetch binary DER certificate with CERT_NONE
     if der_cert is None:
         unverified_ctx = ssl.create_default_context()
         unverified_ctx.check_hostname = False
@@ -456,22 +454,23 @@ def query_rdap_domain(root_domain: str, timeout: int = 8) -> Optional[Dict[str, 
 
 
 def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-    """Fallback raw socket port 43 WHOIS lookup using IANA referral."""
+    """Fallback raw socket port 43 WHOIS lookup."""
     try:
         tld = root_domain.split(".")[-1]
-        whois_server = None
-        with socket.create_connection(("whois.iana.org", 43), timeout=timeout) as s:
-            s.sendall(f"{tld}\r\n".encode("utf-8"))
-            resp = b""
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                resp += chunk
-        text_iana = resp.decode("utf-8", errors="replace")
-        m_srv = re.search(r"^whois:\s*(\S+)", text_iana, re.IGNORECASE | re.MULTILINE)
-        if m_srv:
-            whois_server = m_srv.group(1).strip()
+        whois_server = "whois.vnnic.vn" if root_domain.endswith(".vn") else None
+        if not whois_server:
+            with socket.create_connection(("whois.iana.org", 43), timeout=timeout) as s:
+                s.sendall(f"{tld}\r\n".encode("utf-8"))
+                resp = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+            text_iana = resp.decode("utf-8", errors="replace")
+            m_srv = re.search(r"^whois:\s*(\S+)", text_iana, re.IGNORECASE | re.MULTILINE)
+            if m_srv:
+                whois_server = m_srv.group(1).strip()
 
         if not whois_server:
             return None
@@ -492,6 +491,7 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
             r"Expiration Date:\s*(.+)",
             r"Expiry Date:\s*(.+)",
             r"Expire Date:\s*(.+)",
+            r"Ngày hết hạn:\s*(.+)",
             r"paid-till:\s*(.+)",
             r"Valid Until:\s*(.+)",
             r"Expiration Time:\s*(.+)",
@@ -508,6 +508,8 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
             r"Creation Date:\s*(.+)",
             r"Created On:\s*(.+)",
             r"Registered On:\s*(.+)",
+            r"Issue Date:\s*(.+)",
+            r"Ngày đăng ký:\s*(.+)",
             r"Registration Time:\s*(.+)",
         ]
         reg_date = None
@@ -519,7 +521,7 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
                     break
 
         registrar = None
-        m_reg = re.search(r"Registrar:\s*(.+)", raw_text, re.IGNORECASE)
+        m_reg = re.search(r"(?:Registrar|Nhà đăng ký):\s*(.+)", raw_text, re.IGNORECASE)
         if m_reg:
             registrar = m_reg.group(1).strip()
 
@@ -540,40 +542,59 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
 
 
 def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
-    """Parse either JSON or HTML/text from Vietnamese WHOIS gateways."""
+    """Parse either JSON or HTML/text from Vietnamese WHOIS gateways (BKNS, iNET, PA Vietnam)."""
     if not raw_payload or not raw_payload.strip():
         return None
 
-    # Try JSON first
     try:
         data = json.loads(raw_payload)
-        if isinstance(data, dict) and data.get("contents"):
-            # Unwrap allorigins JSON wrapper if present
+        if isinstance(data, dict) and isinstance(data.get("contents"), str):
             data = json.loads(data["contents"])
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
         if isinstance(data, dict):
+            reg_obj = data.get("registration") if isinstance(data.get("registration"), dict) else {}
             exp_raw = (
-                data.get("expirationDate")
+                data.get("expiryDate")
+                or data.get("expirationDate")
                 or data.get("expireDate")
                 or data.get("expiration_date")
+                or data.get("expiry_date")
                 or data.get("registryExpiryDate")
                 or data.get("expiredDate")
+                or data.get("expiresAt")
+                or data.get("expires_at")
+                or reg_obj.get("expires_at")
             )
             reg_raw = (
                 data.get("creationDate")
                 or data.get("createDate")
                 or data.get("creation_date")
+                or data.get("createdDate")
                 or data.get("issueDate")
+                or data.get("registeredAt")
+                or reg_obj.get("created_at")
             )
             exp_date = parse_any_date(exp_raw)
             reg_date = parse_any_date(reg_raw)
-            registrar = data.get("registrar") or data.get("registrarName")
+            registrar = (
+                data.get("registrar")
+                or data.get("registrarName")
+                or reg_obj.get("registrar")
+            )
 
-            raw_ns = data.get("nameServer") or data.get("nameServers") or data.get("nameservers") or []
+            raw_ns = (
+                data.get("nameServers")
+                or data.get("nameServer")
+                or data.get("nameservers")
+                or data.get("name_servers")
+                or []
+            )
             if isinstance(raw_ns, str):
                 raw_ns = [x.strip() for x in re.split(r"[,;\s]+", raw_ns) if x.strip()]
             nameservers = [str(ns).lower().rstrip(".") for ns in raw_ns if ns][:6]
 
-            raw_text = str(data.get("rawtext") or data.get("rawText") or "")
+            raw_text = str(data.get("rawtext") or data.get("rawText") or data.get("raw") or "")
             if not exp_date and raw_text:
                 m = re.search(
                     r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*[:\-]?\s*([^\r\n]+)",
@@ -610,7 +631,6 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallback: parse HTML or plain text
     clean_txt = re.sub(r"<[^>]+>", "\n", raw_payload)
     exp_date = None
     for pat in [
@@ -652,11 +672,59 @@ def parse_vn_whois_payload(raw_payload: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def query_vn_registrar_whois(root_domain: str, timeout: int = 12) -> Optional[Dict[str, Any]]:
+def query_bkns_vn_whois(root_domain: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
+    """
+    Query BKNS Official VNNIC REST API (/api/v1/whois).
+    Handles the demo key rate limit (2 req/min) gracefully with a thread lock and retry.
+    """
+    api_key = os.environ.get("BKNS_API_KEY", "").strip() or DEFAULT_BKNS_DEMO_KEY
+    url = f"https://whois.bkns.vn/api/v1/whois?domain={urllib.parse.quote(root_domain)}"
+    headers = {
+        "X-API-Key": api_key,
+        "Accept": "application/json",
+        "User-Agent": "SysadminSSLMonitor/1.0",
+    }
+
+    with _BKNS_LOCK:
+        for attempt in range(2):
+            if HAS_REQUESTS:
+                try:
+                    resp = pyrequests.get(url, headers=headers, timeout=timeout)
+                    if resp.status_code == 200 and resp.text:
+                        parsed = parse_vn_whois_payload(resp.text)
+                        if parsed and parsed.get("expiry_date"):
+                            parsed["source"] = "VNNIC (BKNS API)"
+                            return parsed
+                    elif resp.status_code == 429 and attempt == 0:
+                        retry_after = int(resp.headers.get("Retry-After", "31") or "31")
+                        wait_s = min(max(retry_after, 15), 35)
+                        print(f"    [VNNIC Rate-Limit] Đợi {wait_s}s để lấy tiếp hạn tên miền {root_domain}...")
+                        time.sleep(wait_s)
+                        continue
+                except Exception:
+                    pass
+            else:
+                txt = http_get_text(url, headers=headers, timeout=timeout)
+                if txt:
+                    parsed = parse_vn_whois_payload(txt)
+                    if parsed and parsed.get("expiry_date"):
+                        parsed["source"] = "VNNIC (BKNS API)"
+                        return parsed
+            break
+    return None
+
+
+def query_vn_registrar_whois(root_domain: str, timeout: int = 6) -> Optional[Dict[str, Any]]:
     """
     Query Vietnamese accredited VNNIC registrar WHOIS gateways across multiple direct
     and relay endpoints so even US GitHub Actions runners can resolve .vn domains reliably.
     """
+    # 1. Try BKNS Official VNNIC REST API first (works globally including GitHub Actions US IPs)
+    bkns_res = query_bkns_vn_whois(root_domain, timeout=timeout)
+    if bkns_res and bkns_res.get("expiry_date"):
+        return bkns_res
+
+    # 2. Try iNET & PA Vietnam gateways (direct + proxies)
     inet_url = f"https://whois.inet.vn/api/whois/domainspecify/{urllib.parse.quote(root_domain)}"
     pa_url = f"https://whois.pavietnam.vn/whois.php?domain={urllib.parse.quote(root_domain)}&cmd=get_whois"
 
@@ -667,7 +735,6 @@ def query_vn_registrar_whois(root_domain: str, timeout: int = 12) -> Optional[Di
         f"https://corsproxy.io/?{urllib.parse.quote(inet_url, safe='')}",
         pa_url,
         f"https://api.allorigins.win/raw?url={urllib.parse.quote(pa_url, safe='')}",
-        f"https://api.codetabs.com/v1/proxy?quest={pa_url}",
     ]
 
     headers = {
@@ -693,6 +760,7 @@ def check_domain_registration(
     warn_days: int = 30,
     crit_days: int = 14,
     cached_info: Optional[Dict[str, Any]] = None,
+    prev_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Checks domain WHOIS / RDAP expiration date, registrar, creation date, and nameservers.
@@ -718,8 +786,18 @@ def check_domain_registration(
     nameservers: List[str] = query_doh_nameservers(root_domain)
     source: Optional[str] = None
 
-    # 1. For .vn domains, query VNNIC / Vietnamese Registrar WHOIS API first
-    if root_domain.endswith(".vn"):
+    # Check if we already have a verified expiry date from previous results (> 45 days left)
+    # to avoid burning rate limits unnecessarily for .vn domains
+    if root_domain.endswith(".vn") and prev_result and prev_result.get("domain_expiry_date"):
+        prev_exp = parse_any_date(prev_result.get("domain_expiry_date"))
+        if prev_exp and (prev_exp - now_utc()).days > 45:
+            exp_dt = prev_exp
+            reg_dt = parse_any_date(prev_result.get("domain_creation_date"))
+            registrar = prev_result.get("domain_registrar")
+            source = prev_result.get("domain_source") or "VNNIC (Cached)"
+
+    # 1. For .vn domains, query VNNIC / Vietnamese Registrar WHOIS API
+    if exp_dt is None and root_domain.endswith(".vn"):
         vn_info = query_vn_registrar_whois(root_domain)
         if vn_info and vn_info.get("expiry_date"):
             exp_dt = vn_info["expiry_date"]
@@ -773,7 +851,7 @@ def check_domain_registration(
             result["domain_error"] = f"WHOIS lookup warning: {exc}"
 
     # 5. Fallback to raw socket WHOIS
-    if exp_dt is None and not root_domain.endswith(".vn"):
+    if exp_dt is None:
         raw_info = query_raw_whois_socket(root_domain)
         if raw_info and raw_info.get("expiry_date"):
             exp_dt = raw_info["expiry_date"]
@@ -783,7 +861,7 @@ def check_domain_registration(
                 nameservers = raw_info["nameservers"]
             source = raw_info.get("source", "Raw WHOIS")
 
-    # 6. Fallback to cached WHOIS info synced from Browser in Vietnam (if US runner was geo-blocked)
+    # 6. Fallback to cached WHOIS info synced from Browser or previous result
     if exp_dt is None and cached_info:
         c_exp = parse_any_date(cached_info.get("cached_domain_expiry"))
         if c_exp:
@@ -791,6 +869,14 @@ def check_domain_registration(
             reg_dt = parse_any_date(cached_info.get("cached_creation_date")) or reg_dt
             registrar = cached_info.get("cached_registrar") or registrar
             source = "VNNIC (Đồng bộ)"
+
+    if exp_dt is None and prev_result and prev_result.get("domain_expiry_date"):
+        p_exp = parse_any_date(prev_result.get("domain_expiry_date"))
+        if p_exp:
+            exp_dt = p_exp
+            reg_dt = parse_any_date(prev_result.get("domain_creation_date")) or reg_dt
+            registrar = prev_result.get("domain_registrar") or registrar
+            source = prev_result.get("domain_source") or "Cached"
 
     # 7. Manual override (`custom_domain_expiry` in domains.json)
     if custom_expiry and custom_expiry.strip():
@@ -823,7 +909,11 @@ def check_domain_registration(
     return result
 
 
-def scan_single_entry(entry: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+def scan_single_entry(
+    entry: Dict[str, Any],
+    settings: Dict[str, Any],
+    prev_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Scan both SSL and Domain expiry for a single domain entry."""
     raw_domain = entry.get("domain", "")
     hostname = clean_hostname(raw_domain)
@@ -865,6 +955,7 @@ def scan_single_entry(entry: Dict[str, Any], settings: Dict[str, Any]) -> Dict[s
             warn_days=warn_dom,
             crit_days=crit_dom,
             cached_info=entry,
+            prev_result=prev_result,
         )
         item.update(dom_res)
     else:
@@ -1071,12 +1162,30 @@ def main() -> int:
     settings = config_data.get("settings", {})
     domains_list = config_data.get("domains", [])
 
+    # Load previous results to preserve already-known .vn expiry dates if rate-limited
+    output_path = Path(args.output)
+    prev_map: Dict[str, Dict[str, Any]] = {}
+    if output_path.exists():
+        try:
+            with open(output_path, "r", encoding="utf-8") as pf:
+                prev_data = json.load(pf)
+                for p_item in prev_data.get("items", []):
+                    if p_item.get("domain"):
+                        prev_map[clean_hostname(p_item["domain"])] = p_item
+        except Exception:
+            pass
+
     print(f"[*] Bắt đầu kiểm tra {len(domains_list)} tên miền...")
     items: List[Dict[str, Any]] = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         future_map = {
-            executor.submit(scan_single_entry, entry, settings): entry
+            executor.submit(
+                scan_single_entry,
+                entry,
+                settings,
+                prev_map.get(clean_hostname(entry.get("domain", ""))),
+            ): entry
             for entry in domains_list
             if entry.get("domain")
         }
@@ -1086,7 +1195,7 @@ def main() -> int:
             print(
                 f"  - {res['domain']}:{res['port']} -> "
                 f"SSL: {res.get('ssl_status')} ({res.get('ssl_days_left')}d) | "
-                f"Domain: {res.get('domain_status')} ({res.get('domain_days_left')}d, Reg: {res.get('domain_registrar')})"
+                f"Domain: {res.get('domain_status')} ({res.get('domain_days_left')}d, Exp: {res.get('domain_expiry_date')}, Reg: {res.get('domain_registrar')})"
             )
 
     def sort_key(x: Dict[str, Any]) -> Tuple[int, int, str]:
@@ -1120,7 +1229,6 @@ def main() -> int:
         "items": items,
     }
 
-    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_payload, f, ensure_ascii=False, indent=2)

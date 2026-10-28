@@ -10,6 +10,8 @@ const STORAGE_KEYS = {
   THEME: "ssl_monitor_ds_theme_v1",
 };
 
+const BKNS_DEMO_API_KEY = "bkns_dmo_2376da23bd44858c8390aeeb93065404d21ede1ba2c5d59c0cffc33d6e83c2dd";
+
 const MULTI_PART_TLDS = new Set([
   "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn", "int.vn", "ac.vn",
   "biz.vn", "info.vn", "name.vn", "pro.vn", "health.vn", "io.vn", "ai.vn",
@@ -366,19 +368,44 @@ function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
     if (data && typeof data.contents === "string") {
       data = JSON.parse(data.contents);
     }
+    if (data && typeof data === "object" && data.data && typeof data.data === "object") {
+      data = data.data;
+    }
     if (data && typeof data === "object") {
+      const regObj = data.registration && typeof data.registration === "object" ? data.registration : {};
       let expDate = parseFlexibleDate(
-        data.expirationDate || data.expireDate || data.expiration_date || data.registryExpiryDate || data.expiredDate
+        data.expiryDate ||
+          data.expirationDate ||
+          data.expireDate ||
+          data.expiration_date ||
+          data.registryExpiryDate ||
+          data.expiredDate ||
+          data.expiresAt ||
+          data.expires_at ||
+          regObj.expires_at ||
+          regObj.expiration_date
       );
       let regDate = parseFlexibleDate(
-        data.creationDate || data.createDate || data.creation_date || data.issueDate
+        data.creationDate ||
+          data.createDate ||
+          data.creation_date ||
+          data.issueDate ||
+          data.registeredDate ||
+          regObj.created_at
       );
-      let registrar = data.registrar || data.registrarName || "";
-      const nsList = Array.isArray(data.nameServer)
-        ? data.nameServer.map((n) => String(n).toLowerCase())
+      let registrar =
+        (typeof data.registrar === "object" && data.registrar ? data.registrar.name : data.registrar) ||
+        data.registrarName ||
+        "";
+      const rawNs = data.nameServer || data.nameServers || data.nameservers || data.DNS;
+      const nsList = Array.isArray(rawNs)
+        ? rawNs
+            .map((n) => (typeof n === "object" && n ? String(n.ldhName || n.name || "") : String(n)))
+            .map((s) => s.toLowerCase().trim())
+            .filter(Boolean)
         : fallbackNs;
 
-      const raw = String(data.rawtext || data.rawText || "");
+      const raw = String(data.rawtext || data.rawText || data.raw || "");
       if (!expDate && raw) {
         const m = raw.match(/(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*[:\-]?\s*([^\r\n]+)/i);
         if (m) expDate = parseFlexibleDate(m[1]);
@@ -392,7 +419,7 @@ function parseVnWhoisPayloadInBrowser(rawText, fallbackNs = []) {
         if (m) registrar = m[1].trim();
       }
       if (expDate) {
-        return { expDate, regDate, registrar, nsList };
+        return { expDate, regDate, registrar, nsList: nsList.length ? nsList : fallbackNs };
       }
     }
   } catch (_) {}
@@ -450,24 +477,26 @@ async function performBrowserLiveCheck(domainEntry) {
     }
   } catch (_) {}
 
-  // 2. Query VN-WHOIS (with CORS-safe relays) & RDAP in browser
+  // 2. Query VNNIC / BKNS / VN-WHOIS & RDAP in browser
   if (domainEntry.check_domain !== false) {
     let foundWhois = false;
+    const bknsUrl = `https://whois.bkns.vn/api/v1/whois?domain=${encodeURIComponent(rootDomain)}`;
     const inetUrl = `https://whois.inet.vn/api/whois/domainspecify/${encodeURIComponent(rootDomain)}`;
     const paUrl = `https://whois.pavietnam.vn/whois.php?domain=${encodeURIComponent(rootDomain)}&cmd=get_whois`;
 
-    const candidateGateways = [
-      inetUrl,
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(inetUrl)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${inetUrl}`,
-      `https://corsproxy.io/?${encodeURIComponent(inetUrl)}`,
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(paUrl)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${paUrl}`,
+    const candidateRequests = [
+      { url: bknsUrl, headers: { Accept: "application/json", "X-API-Key": BKNS_DEMO_API_KEY } },
+      { url: inetUrl, headers: { Accept: "application/json" } },
+      { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(inetUrl)}` },
+      { url: `https://api.codetabs.com/v1/proxy?quest=${inetUrl}` },
+      { url: `https://corsproxy.io/?${encodeURIComponent(inetUrl)}` },
+      { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(paUrl)}` },
+      { url: `https://api.codetabs.com/v1/proxy?quest=${paUrl}` },
     ];
 
-    for (const gwUrl of candidateGateways) {
+    for (const reqCfg of candidateRequests) {
       try {
-        const resp = await fetch(gwUrl);
+        const resp = await fetch(reqCfg.url, reqCfg.headers ? { headers: reqCfg.headers } : undefined);
         if (!resp.ok) continue;
         const rawText = await resp.text();
         const parsed = parseVnWhoisPayloadInBrowser(rawText, item.domain_nameservers || []);
@@ -677,7 +706,7 @@ async function performSaveDomainsConfig(commitMessage, silent = false) {
 
   if (!silent) {
     showBanner(
-      "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & WHOIS ngầm (sẽ cập nhật sau ~30 giây)..."
+      "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & VNNIC WHOIS ngầm (sẽ cập nhật sau ~35-60 giây)..."
     );
   }
   scheduleAutoRefreshAfterAction();
@@ -704,7 +733,7 @@ async function triggerWorkflowDispatch(forceEmail = false, testEmail = false) {
     showBanner(
       testEmail
         ? "✉️ Đã kích hoạt gửi Email Test! Vui lòng kiểm tra hộp thư Groupware của bạn sau khoảng 30–45 giây."
-        : "🔄 GitHub Actions đang chạy quét toàn bộ SSL & Domain! Kết quả sẽ tự động làm mới sau ~35 giây..."
+        : "🔄 GitHub Actions đang chạy quét toàn bộ SSL & Domain! Kết quả sẽ tự động làm mới sau ~35-60 giây..."
     );
     scheduleAutoRefreshAfterAction();
   } catch (err) {
@@ -713,8 +742,9 @@ async function triggerWorkflowDispatch(forceEmail = false, testEmail = false) {
 }
 
 function scheduleAutoRefreshAfterAction() {
-  setTimeout(() => loadAllData(), 25000);
-  setTimeout(() => loadAllData(), 45000);
+  [25000, 50000, 80000, 110000, 140000].forEach((delayMs) => {
+    setTimeout(() => loadAllData(), delayMs);
+  });
 }
 
 // Rendering UI
@@ -771,14 +801,14 @@ function renderGroupFilterOptions() {
   if (groups.includes(currentVal)) select.value = currentVal;
 }
 
-function formatStatusBadge(status, daysLeft) {
+function formatStatusBadge(status, daysLeft, isAlreadyScanned = false) {
   const labelMap = {
     ok: "An toàn",
     warning: "Sắp hết hạn",
     critical: "Khẩn cấp",
     expired: "ĐÃ HẾT HẠN",
     error: "Lỗi kết nối",
-    unknown: "Đang chờ quét",
+    unknown: isAlreadyScanned ? "Chưa rõ hạn" : "Đang chờ quét",
     skipped: "Bỏ qua",
   };
   const st = status || "unknown";
@@ -878,9 +908,10 @@ function renderTable() {
 
   tbody.innerHTML = list
     .map((it) => {
-      const sslBadge = formatStatusBadge(it.ssl_status, it.ssl_days_left);
+      const isScanned = Boolean(it.checked_at && !String(it.checked_at).includes("Đang chờ"));
+      const sslBadge = formatStatusBadge(it.ssl_status, it.ssl_days_left, isScanned);
       const sslBar = formatProgressBar(it.ssl_status, it.ssl_days_left, 90);
-      const domBadge = formatStatusBadge(it.domain_status, it.domain_days_left);
+      const domBadge = formatStatusBadge(it.domain_status, it.domain_days_left, isScanned);
       const domBar = formatProgressBar(it.domain_status, it.domain_days_left, 365);
 
       const sslExpText = it.ssl_valid_to
@@ -973,6 +1004,7 @@ window.openDetailModal = function (domain, port) {
   );
   if (!it) return;
 
+  const isScanned = Boolean(it.checked_at && !String(it.checked_at).includes("Đang chờ"));
   document.getElementById("detailTitle").textContent = `🔍 Chi tiết: ${it.domain}:${it.port || 443}`;
   const sans = (it.ssl_sans || []).join(", ") || "—";
   const ns = (it.domain_nameservers || []).join(", ") || "—";
@@ -985,7 +1017,7 @@ window.openDetailModal = function (domain, port) {
     <div class="detail-grid">
       <div class="detail-card">
         <h4>🔒 Thông tin Chứng chỉ SSL / TLS</h4>
-        <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.ssl_status, it.ssl_days_left)}</span></div>
+        <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.ssl_status, it.ssl_days_left, isScanned)}</span></div>
         <div class="kv-row"><span class="kv-key">Subject (CN):</span><span class="kv-val">${escapeHtml(it.ssl_subject || "—")}</span></div>
         <div class="kv-row"><span class="kv-key">Tổ chức cấp (Issuer CA):</span><span class="kv-val">${escapeHtml(it.ssl_issuer || "—")}</span></div>
         <div class="kv-row"><span class="kv-key">Ngày cấp (Valid From):</span><span class="kv-val">${escapeHtml(it.ssl_valid_from || "—")}</span></div>
@@ -998,7 +1030,7 @@ window.openDetailModal = function (domain, port) {
 
       <div class="detail-card">
         <h4>🌍 Thông tin Tên miền (VNNIC / WHOIS / RDAP)</h4>
-        <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.domain_status, it.domain_days_left)}</span></div>
+        <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.domain_status, it.domain_days_left, isScanned)}</span></div>
         <div class="kv-row"><span class="kv-key">Tên miền gốc (Root):</span><span class="kv-val">${escapeHtml(it.domain_root || extractRootDomain(it.domain))}</span></div>
         <div class="kv-row"><span class="kv-key">Nhà đăng ký (Registrar):</span><span class="kv-val">${escapeHtml(it.domain_registrar || "—")}</span></div>
         <div class="kv-row"><span class="kv-key">Ngày đăng ký:</span><span class="kv-val">${escapeHtml(it.domain_creation_date || "—")}</span></div>
