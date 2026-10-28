@@ -1327,7 +1327,7 @@ def build_email_html(
 <body style="font-family:Segoe UI,Roboto,Arial,sans-serif;background-color:#f3f4f6;margin:0;padding:24px;">
   <div style="max-width:860px;margin:0 auto;background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
     <div style="background:#0f172a;color:#ffffff;padding:20px 24px;">
-      <h2 style="margin:0;font-size:20px;">🛡️ Hệ thống Giám sát SSL &amp; Domain</h2>
+      <h2 style="margin:0;font-size:20px;">Hệ thống Giám sát SSL &amp; Domain — duongnvd</h2>
       <p style="margin:6px 0 0;color:#94a3b8;font-size:13px;">Thời gian quét: {now_str} | Tổng số theo dõi: {len(items)} domain</p>
     </div>
     <div style="padding:24px;">

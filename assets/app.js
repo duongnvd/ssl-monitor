@@ -1,5 +1,5 @@
 /**
- * SSL & Domain Monitor — DashStack Admin UI Application
+ * SSL & Domain Monitor — duongnvd Admin UI Application
  * Works on GitHub Pages (https://duongnvd.github.io/ssl-monitor/) and local environments.
  */
 
@@ -102,7 +102,7 @@ function computeOverallStatus(sslStatus, domStatus) {
   return "ok";
 }
 
-// Theme Handling (DashStack Light default + Dark Mode toggle)
+// Theme Handling (Light default + Dark Mode toggle)
 function initTheme() {
   const savedTheme = localStorage.getItem(STORAGE_KEYS.THEME) || "light";
   applyTheme(savedTheme);
@@ -112,7 +112,7 @@ function applyTheme(theme) {
   const isDark = theme === "dark";
   document.body.classList.toggle("dark-theme", isDark);
   const iconEl = document.getElementById("themeIcon");
-  if (iconEl) iconEl.textContent = isDark ? "☀️" : "🌙";
+  if (iconEl) iconEl.textContent = isDark ? "Sáng" : "Tối";
   localStorage.setItem(STORAGE_KEYS.THEME, isDark ? "dark" : "light");
 }
 
@@ -139,10 +139,10 @@ function updateSyncBadge() {
   if (!badge) return;
   if (state.ghConfig.token) {
     badge.className = "ds-sync-pill mode-connected";
-    badge.textContent = `● GitHub: ${state.ghConfig.owner}/${state.ghConfig.repo}`;
+    badge.textContent = `GitHub: ${state.ghConfig.owner}/${state.ghConfig.repo}`;
   } else {
     badge.className = "ds-sync-pill mode-readonly";
-    badge.textContent = "⚡ Chưa gắn Token (Bấm để cấu hình)";
+    badge.textContent = "Chưa gắn Token (Bấm để cấu hình)";
   }
 }
 
@@ -691,14 +691,14 @@ async function performSaveDomainsConfig(commitMessage, silent = false) {
     localStorage.setItem(STORAGE_KEYS.LOCAL_RESULTS, JSON.stringify(state.resultsData));
     if (!silent) {
       showBanner(
-        "💡 Đã lưu tạm trên trình duyệt và tra cứu trực tiếp! Để lưu vĩnh viễn lên GitHub & quét SSL tự động + gửi Email, hãy bấm <strong>⚙️ Cấu hình & Email</strong> để gắn GitHub Token."
+        "Đã lưu tạm trên trình duyệt và tra cứu trực tiếp. Để lưu vĩnh viễn lên GitHub và quét SSL tự động kèm gửi Email, hãy bấm <strong>Cấu hình &amp; Email</strong> để gắn GitHub Token."
       );
     }
     return;
   }
 
   if (!silent) {
-    showBanner("⏳ Đang đồng bộ danh sách tên miền lên GitHub Repository...");
+    showBanner("Đang đồng bộ danh sách tên miền lên GitHub Repository...");
   }
   let sha = state.domainsSha || undefined;
   try {
@@ -751,7 +751,7 @@ async function performSaveDomainsConfig(commitMessage, silent = false) {
 
   if (!silent) {
     showBanner(
-      "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & tra cứu VNNIC (vnnic.vn/whois-information) ngầm..."
+      "Đã lưu lên GitHub. GitHub Actions đang tự động quét chứng chỉ SSL và tra cứu VNNIC (vnnic.vn/whois-information) ngầm..."
     );
   }
   scheduleAutoRefreshAfterAction();
@@ -760,11 +760,11 @@ async function performSaveDomainsConfig(commitMessage, silent = false) {
 async function triggerWorkflowDispatch(forceEmail = false, testEmail = false) {
   if (!state.ghConfig.token) {
     openModal("modalSettings");
-    showBanner("⚠️ Vui lòng nhập GitHub Personal Access Token trong mục Cấu hình để kích hoạt GitHub Actions.", true);
+    showBanner("Vui lòng nhập GitHub Personal Access Token trong mục Cấu hình để kích hoạt GitHub Actions.", true);
     return;
   }
   try {
-    showBanner("⏳ Đang gửi lệnh kích hoạt GitHub Actions...");
+    showBanner("Đang gửi lệnh kích hoạt GitHub Actions...");
     await githubApiRequest("actions/workflows/monitor.yml/dispatches", {
       method: "POST",
       body: JSON.stringify({
@@ -777,8 +777,8 @@ async function triggerWorkflowDispatch(forceEmail = false, testEmail = false) {
     });
     showBanner(
       testEmail
-        ? "✉️ Đã kích hoạt gửi Email Test! Vui lòng kiểm tra hộp thư Groupware của bạn sau khoảng 30–45 giây."
-        : "🔄 GitHub Actions đang chạy quét SSL & tra cứu VNNIC (vnnic.vn/whois-information)! Kết quả sẽ tự động làm mới sau ~35-60 giây..."
+        ? "Đã kích hoạt gửi Email Test. Vui lòng kiểm tra hộp thư Groupware của bạn sau khoảng 30–45 giây."
+        : "GitHub Actions đang chạy quét SSL và tra cứu VNNIC (vnnic.vn/whois-information). Kết quả sẽ tự động làm mới sau ~35-60 giây..."
     );
     scheduleAutoRefreshAfterAction();
   } catch (err) {
@@ -985,7 +985,7 @@ function renderTable() {
               ${it.ssl_ip ? `<span class="ip-pill" title="Địa chỉ IP">${escapeHtml(it.ssl_ip)}</span>` : ""}
               ${it.ssl_protocol ? `<span class="ip-pill">${escapeHtml(it.ssl_protocol)}</span>` : ""}
             </div>
-            ${it.notes ? `<div class="notes-text">📝 ${escapeHtml(it.notes)}</div>` : ""}
+            ${it.notes ? `<div class="notes-text">${escapeHtml(it.notes)}</div>` : ""}
           </td>
 
           <td>
@@ -995,7 +995,7 @@ function renderTable() {
           <td>
             <div class="status-cell-top">
               ${sslBadge}
-              ${it.ssl_latency_ms ? `<span style="font-size:11.5px;color:var(--ds-text-muted)">⚡ ${it.ssl_latency_ms}ms</span>` : ""}
+              ${it.ssl_latency_ms ? `<span style="font-size:11.5px;color:var(--ds-text-muted)">${it.ssl_latency_ms}ms</span>` : ""}
             </div>
             ${sslBar}
             <div class="cell-subinfo">
@@ -1020,13 +1020,13 @@ function renderTable() {
           <td style="text-align: center">
             <div class="ds-action-group">
               <button class="ds-act-btn" onclick="openDetailModal('${escapeHtml(it.domain)}', ${it.port || 443})" title="Xem chi tiết chứng chỉ & WHOIS">
-                🔍
+                Chi tiết
               </button>
               <button class="ds-act-btn" onclick="openEditDomainModal('${escapeHtml(it.domain)}', ${it.port || 443})" title="Chỉnh sửa tên miền">
-                ✏️
+                Sửa
               </button>
               <button class="ds-act-btn act-delete" onclick="deleteDomain('${escapeHtml(it.domain)}', ${it.port || 443})" title="Xóa khỏi danh sách theo dõi">
-                🗑️
+                Xóa
               </button>
             </div>
           </td>
@@ -1052,7 +1052,7 @@ window.openDetailModal = function (domain, port) {
   if (!it) return;
 
   const isScanned = Boolean(it.checked_at && !String(it.checked_at).includes("Đang chờ"));
-  document.getElementById("detailTitle").textContent = `🔍 Chi tiết: ${it.domain}:${it.port || 443}`;
+  document.getElementById("detailTitle").textContent = `Chi tiết: ${it.domain}:${it.port || 443}`;
   const sans = (it.ssl_sans || []).join(", ") || "—";
   const ns = (it.domain_nameservers || []).join(", ") || "—";
   const emails =
@@ -1063,7 +1063,7 @@ window.openDetailModal = function (domain, port) {
   document.getElementById("detailBody").innerHTML = `
     <div class="detail-grid">
       <div class="detail-card">
-        <h4>🔒 Thông tin Chứng chỉ SSL / TLS</h4>
+        <h4>Thông tin Chứng chỉ SSL / TLS</h4>
         <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.ssl_status, it.ssl_days_left, isScanned)}</span></div>
         <div class="kv-row"><span class="kv-key">Subject (CN):</span><span class="kv-val">${escapeHtml(it.ssl_subject || "—")}</span></div>
         <div class="kv-row"><span class="kv-key">Tổ chức cấp (Issuer CA):</span><span class="kv-val">${escapeHtml(it.ssl_issuer || "—")}</span></div>
@@ -1076,7 +1076,7 @@ window.openDetailModal = function (domain, port) {
       </div>
 
       <div class="detail-card">
-        <h4>🌍 Thông tin Tên miền (VNNIC / WHOIS / RDAP)</h4>
+        <h4>Thông tin Tên miền (VNNIC / WHOIS / RDAP)</h4>
         <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.domain_status, it.domain_days_left, isScanned)}</span></div>
         <div class="kv-row"><span class="kv-key">Tên miền gốc (Root):</span><span class="kv-val">${escapeHtml(it.domain_root || extractRootDomain(it.domain))}</span></div>
         <div class="kv-row"><span class="kv-key">Tên chủ thể đăng ký:</span><span class="kv-val"><strong>${escapeHtml(it.domain_registrant || "—")}</strong></span></div>
@@ -1084,7 +1084,7 @@ window.openDetailModal = function (domain, port) {
         <div class="kv-row"><span class="kv-key">Ngày đăng ký:</span><span class="kv-val">${escapeHtml(it.domain_creation_date || "—")}</span></div>
         <div class="kv-row"><span class="kv-key">Ngày hết hạn Domain:</span><span class="kv-val"><strong>${escapeHtml(it.domain_expiry_date || "—")}</strong></span></div>
         <div class="kv-row"><span class="kv-key">Máy chủ DNS chuyển giao:</span><span class="kv-val">${escapeHtml(ns)}</span></div>
-        <div class="kv-row"><span class="kv-key">Nguồn tra cứu:</span><span class="kv-val">${escapeHtml(it.domain_source || "—")} • <a href="https://vnnic.vn/whois-information/" target="_blank" rel="noopener" style="color:var(--ds-primary)">Mở VNNIC ↗</a></span></div>
+        <div class="kv-row"><span class="kv-key">Nguồn tra cứu:</span><span class="kv-val">${escapeHtml(it.domain_source || "—")} • <a href="https://vnnic.vn/whois-information/" target="_blank" rel="noopener" style="color:var(--ds-primary)">Mở VNNIC</a></span></div>
         <div class="kv-row"><span class="kv-key">Email nhận cảnh báo:</span><span class="kv-val">${escapeHtml(emails)}</span></div>
       </div>
     </div>
@@ -1098,7 +1098,7 @@ window.openEditDomainModal = function (domain, port) {
   );
   if (!entry) return;
 
-  document.getElementById("modalDomainTitle").textContent = `✏️ Chỉnh sửa: ${domain}`;
+  document.getElementById("modalDomainTitle").textContent = `Chỉnh sửa: ${domain}`;
   document.getElementById("domainId").value = entry.id || `${domain}:${port}`;
   document.getElementById("inputDomain").value = entry.domain;
   document.getElementById("inputPort").value = entry.port || 443;
@@ -1270,7 +1270,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const openAddDomainFn = (e) => {
     if (e) e.preventDefault();
-    document.getElementById("modalDomainTitle").textContent = "➕ Thêm Tên miền theo dõi";
+    document.getElementById("modalDomainTitle").textContent = "Thêm Tên miền theo dõi";
     document.getElementById("formDomain").reset();
     document.getElementById("domainId").value = "";
     document.getElementById("inputPort").value = "443";
