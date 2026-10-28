@@ -53,8 +53,9 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install system whois & Python dependencies
         run: |
+          sudo apt-get update -y && sudo apt-get install -y whois
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 

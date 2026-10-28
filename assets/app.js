@@ -39,6 +39,7 @@ const state = {
     summary: { total: 0, healthy: 0, warning: 0, critical: 0 },
     items: [],
   },
+  domainsSha: null,
 };
 
 // Utility Functions
@@ -140,6 +141,7 @@ async function loadAllData() {
         const domFile = await githubGetFile("data/domains.json");
         if (domFile && domFile.content) {
           domainsJson = JSON.parse(base64ToUtf8(domFile.content));
+          if (domFile.sha) state.domainsSha = domFile.sha;
         }
         const resFile = await githubGetFile("data/results.json");
         if (resFile && resFile.content) {
@@ -258,8 +260,52 @@ function recalculateSummary() {
   };
 }
 
+function parseFlexibleDate(raw) {
+  if (!raw) return null;
+  if (typeof raw === "number") {
+    const ms = raw > 1e11 ? raw : raw * 1000;
+    const d = new Date(ms);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const s = String(raw).trim();
+  if (!s) return null;
+  // Match DD-MM-YYYY or DD/MM/YYYY
+  const mDmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})/);
+  if (mDmy) {
+    const d = new Date(Date.UTC(Number(mDmy[3]), Number(mDmy[2]) - 1, Number(mDmy[1])));
+    if (!isNaN(d.getTime())) return d;
+  }
+  const dIso = new Date(s);
+  return isNaN(dIso.getTime()) ? null : dIso;
+}
+
+function normalizeRegistrar(reg, nameservers = []) {
+  const r = String(reg || "").trim();
+  const rLow = r.toLowerCase();
+  const nsStr = (nameservers || []).join(" ").toLowerCase();
+  if (rLow.includes("mắt bão") || rLow.includes("mat bao") || rLow.includes("matbao")) {
+    return rLow.includes("mắt bão") ? r : `Mắt Bão (${r})`;
+  }
+  if (rLow.includes("gmo-z.com") || rLow.includes("runsystem") || rLow.includes("tenten")) {
+    return "Tenten.vn (GMO-Z.com RUNSYSTEM)";
+  }
+  if (rLow.includes("p.a việt nam") || rLow.includes("p.a viet nam") || rLow.includes("pavietnam")) {
+    return "P.A Việt Nam";
+  }
+  if (rLow.includes("nhân hòa") || rLow.includes("nhan hoa") || rLow.includes("nhanhoa")) {
+    return "Nhân Hòa";
+  }
+  if (!r) {
+    if (nsStr.includes("matbao")) return "Mắt Bão (Theo Nameserver)";
+    if (nsStr.includes("tenten") || nsStr.includes("z.com")) return "Tenten.vn (Theo Nameserver)";
+    if (nsStr.includes("pavietnam")) return "P.A Việt Nam (Theo Nameserver)";
+    if (nsStr.includes("nhanhoa")) return "Nhân Hòa (Theo Nameserver)";
+  }
+  return r || null;
+}
+
 /**
- * Live Browser-Side Lookup (DNS-over-HTTPS + RDAP) so when a sysadmin adds a domain,
+ * Live Browser-Side Lookup (DNS-over-HTTPS + VN-WHOIS + RDAP) so when a sysadmin adds a domain,
  * they immediately see the IP and Domain WHOIS/RDAP expiration without waiting!
  */
 async function performBrowserLiveCheck(domainEntry) {
@@ -269,7 +315,7 @@ async function performBrowserLiveCheck(domainEntry) {
   const item = state.resultsData.items.find((x) => x.domain === host && Number(x.port || 443) === port);
   if (!item) return;
 
-  // 1. Resolve IP via Cloudflare DNS-over-HTTPS
+  // 1. Resolve IP & Nameservers via Cloudflare DNS-over-HTTPS
   try {
     const dnsResp = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, {
       headers: { Accept: "application/dns-json" },
@@ -281,54 +327,110 @@ async function performBrowserLiveCheck(domainEntry) {
         item.ssl_ip = aRec.data;
       }
     }
+    const nsResp = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(rootDomain)}&type=NS`, {
+      headers: { Accept: "application/dns-json" },
+    });
+    if (nsResp.ok) {
+      const nsData = await nsResp.json();
+      const nsList = (nsData.Answer || [])
+        .filter((a) => a.type === 2 && a.data)
+        .map((a) => String(a.data).toLowerCase().replace(/\.$/, ""));
+      if (nsList.length > 0) {
+        item.domain_nameservers = nsList.slice(0, 6);
+        const inferredReg = normalizeRegistrar("", nsList);
+        if (inferredReg && (!item.domain_registrar || item.domain_registrar.includes("Đang tra cứu"))) {
+          item.domain_registrar = inferredReg;
+        }
+      }
+    }
   } catch (_) {}
 
-  // 2. Query RDAP in browser for Domain Expiry Date & Registrar
+  // 2. Query VN-WHOIS & RDAP in browser for Domain Expiry Date & Registrar
   if (domainEntry.check_domain !== false) {
-    try {
-      const rdapUrls = [`https://rdap.org/domain/${encodeURIComponent(rootDomain)}`];
-      for (const url of rdapUrls) {
-        const r = await fetch(url, { headers: { Accept: "application/rdap+json, application/json" } });
-        if (!r.ok) continue;
-        const data = await r.json();
-        let expDate = null;
-        let regDate = null;
-        for (const ev of data.events || []) {
-          const action = String(ev.eventAction || "").toLowerCase();
-          if (action.includes("expir") && ev.eventDate) expDate = new Date(ev.eventDate);
-          if (action.includes("registr") && ev.eventDate) regDate = new Date(ev.eventDate);
-        }
-        let registrar = null;
-        for (const ent of data.entities || []) {
-          const roles = (ent.roles || []).map((x) => x.toLowerCase());
-          if (roles.includes("registrar") && Array.isArray(ent.vcardArray) && Array.isArray(ent.vcardArray[1])) {
-            for (const row of ent.vcardArray[1]) {
-              if (Array.isArray(row) && (row[0] === "fn" || row[0] === "org") && row[3]) {
-                registrar = String(row[3]);
-                break;
-              }
-            }
-          }
-        }
-        const nameservers = (data.nameservers || []).map((n) => String(n.ldhName || "").toLowerCase()).filter(Boolean);
+    let foundWhois = false;
 
-        if (expDate && !isNaN(expDate.getTime())) {
+    // 2a. Try VN-WHOIS gateway (supports .vn & international domains on Mắt Bão / Tenten)
+    try {
+      const vnResp = await fetch(`https://whois.inet.vn/api/whois/domainspecify/${encodeURIComponent(rootDomain)}`);
+      if (vnResp.ok) {
+        const vnData = await vnResp.json();
+        const expDate = parseFlexibleDate(
+          vnData.expirationDate || vnData.expireDate || vnData.expiration_date
+        );
+        const regDate = parseFlexibleDate(
+          vnData.creationDate || vnData.createDate || vnData.creation_date
+        );
+        if (expDate) {
           const daysLeft = Math.floor((expDate.getTime() - Date.now()) / 86400000);
+          const nsList = Array.isArray(vnData.nameServer)
+            ? vnData.nameServer.map((n) => String(n).toLowerCase())
+            : item.domain_nameservers || [];
           item.domain_days_left = daysLeft;
           item.domain_expiry_date = expDate.toISOString().slice(0, 10);
-          item.domain_creation_date = regDate && !isNaN(regDate.getTime()) ? regDate.toISOString().slice(0, 10) : null;
-          item.domain_registrar = registrar || "RDAP Verified";
-          item.domain_nameservers = nameservers.slice(0, 6);
-          item.domain_source = "RDAP (Live)";
+          item.domain_creation_date = regDate ? regDate.toISOString().slice(0, 10) : null;
+          item.domain_registrar =
+            normalizeRegistrar(vnData.registrar || vnData.registrarName, nsList) || "VNNIC Verified";
+          item.domain_nameservers = nsList.slice(0, 6);
+          item.domain_source = "VNNIC / VN-WHOIS";
+          item.domain_error = null;
           item.domain_status = classifyStatus(
             daysLeft,
             state.domainsConfig.settings.alert_days_domain || 30,
             state.domainsConfig.settings.critical_days_domain || 14
           );
-          break;
+          foundWhois = true;
         }
       }
     } catch (_) {}
+
+    // 2b. Fallback to RDAP (for international domains)
+    if (!foundWhois && !rootDomain.endsWith(".vn")) {
+      try {
+        const rdapUrls = [`https://rdap.org/domain/${encodeURIComponent(rootDomain)}`];
+        for (const url of rdapUrls) {
+          const r = await fetch(url, { headers: { Accept: "application/rdap+json, application/json" } });
+          if (!r.ok) continue;
+          const data = await r.json();
+          let expDate = null;
+          let regDate = null;
+          for (const ev of data.events || []) {
+            const action = String(ev.eventAction || "").toLowerCase();
+            if (action.includes("expir") && ev.eventDate) expDate = new Date(ev.eventDate);
+            if (action.includes("registr") && ev.eventDate) regDate = new Date(ev.eventDate);
+          }
+          let registrar = null;
+          for (const ent of data.entities || []) {
+            const roles = (ent.roles || []).map((x) => x.toLowerCase());
+            if (roles.includes("registrar") && Array.isArray(ent.vcardArray) && Array.isArray(ent.vcardArray[1])) {
+              for (const row of ent.vcardArray[1]) {
+                if (Array.isArray(row) && (row[0] === "fn" || row[0] === "org") && row[3]) {
+                  registrar = String(row[3]);
+                  break;
+                }
+              }
+            }
+          }
+          const nameservers = (data.nameservers || []).map((n) => String(n.ldhName || "").toLowerCase()).filter(Boolean);
+
+          if (expDate && !isNaN(expDate.getTime())) {
+            const daysLeft = Math.floor((expDate.getTime() - Date.now()) / 86400000);
+            item.domain_days_left = daysLeft;
+            item.domain_expiry_date = expDate.toISOString().slice(0, 10);
+            item.domain_creation_date = regDate && !isNaN(regDate.getTime()) ? regDate.toISOString().slice(0, 10) : null;
+            item.domain_registrar = normalizeRegistrar(registrar, nameservers) || "RDAP Verified";
+            item.domain_nameservers = nameservers.slice(0, 6);
+            item.domain_source = "RDAP (Live)";
+            item.domain_error = null;
+            item.domain_status = classifyStatus(
+              daysLeft,
+              state.domainsConfig.settings.alert_days_domain || 30,
+              state.domainsConfig.settings.critical_days_domain || 14
+            );
+            break;
+          }
+        }
+      } catch (_) {}
+    }
   }
 
   // Manual domain expiry override
@@ -358,6 +460,7 @@ async function githubApiRequest(endpoint, options = {}) {
   if (!token) throw new Error("Chưa cấu hình GitHub Personal Access Token");
   const url = `https://api.github.com/repos/${owner}/${repo}/${endpoint}`;
   const resp = await fetch(url, {
+    cache: "no-store",
     ...options,
     headers: {
       Accept: "application/vnd.github+json",
@@ -376,10 +479,19 @@ async function githubApiRequest(endpoint, options = {}) {
 
 async function githubGetFile(path) {
   const { branch } = state.ghConfig;
-  return githubApiRequest(`contents/${path}?ref=${encodeURIComponent(branch)}`);
+  return githubApiRequest(`contents/${path}?ref=${encodeURIComponent(branch)}&_t=${Date.now()}`);
 }
 
-async function saveDomainsConfig(commitMessage) {
+let saveQueuePromise = Promise.resolve();
+
+function saveDomainsConfig(commitMessage) {
+  saveQueuePromise = saveQueuePromise
+    .catch(() => {})
+    .then(() => performSaveDomainsConfig(commitMessage));
+  return saveQueuePromise;
+}
+
+async function performSaveDomainsConfig(commitMessage) {
   if (!state.ghConfig.token) {
     // Save locally in browser localStorage if no GitHub Token is set yet
     localStorage.setItem(STORAGE_KEYS.LOCAL_DOMAINS, JSON.stringify(state.domainsConfig));
@@ -391,22 +503,55 @@ async function saveDomainsConfig(commitMessage) {
   }
 
   showBanner("⏳ Đang đồng bộ danh sách tên miền lên GitHub Repository...");
-  let sha = undefined;
+  let sha = state.domainsSha || undefined;
   try {
     const existing = await githubGetFile("data/domains.json");
-    if (existing && existing.sha) sha = existing.sha;
+    if (existing && existing.sha) {
+      sha = existing.sha;
+      state.domainsSha = existing.sha;
+    }
   } catch (_) {}
 
   const contentFormatted = JSON.stringify(state.domainsConfig, null, 2) + "\n";
-  await githubApiRequest("contents/data/domains.json", {
-    method: "PUT",
-    body: JSON.stringify({
-      message: commitMessage || "chore(domains): cập nhật danh sách theo dõi từ Web UI",
-      content: utf8ToBase64(contentFormatted),
-      sha,
-      branch: state.ghConfig.branch,
-    }),
-  });
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const putResp = await githubApiRequest("contents/data/domains.json", {
+        method: "PUT",
+        body: JSON.stringify({
+          message: commitMessage || "chore(domains): cập nhật danh sách theo dõi từ Web UI",
+          content: utf8ToBase64(contentFormatted),
+          sha,
+          branch: state.ghConfig.branch,
+        }),
+      });
+      if (putResp && putResp.content && putResp.content.sha) {
+        state.domainsSha = putResp.content.sha;
+      }
+      break;
+    } catch (err) {
+      const errMsg = String(err.message || "");
+      // Nếu gặp lỗi 409 Conflict do SHA cũ, tự động bóc SHA mới nhất từ thông báo lỗi của GitHub và thử lại ngay
+      const matchSha = errMsg.match(/does not match ([0-9a-f]{40})/i);
+      if (matchSha && attempt < maxAttempts) {
+        sha = matchSha[1];
+        state.domainsSha = sha;
+        continue;
+      }
+      if (errMsg.includes("409") && attempt < maxAttempts) {
+        try {
+          const fresh = await githubGetFile("data/domains.json");
+          if (fresh && fresh.sha) {
+            sha = fresh.sha;
+            state.domainsSha = sha;
+          }
+        } catch (_) {}
+        continue;
+      }
+      throw err;
+    }
+  }
 
   showBanner(
     "✅ Đã lưu lên GitHub! GitHub Actions đang tự động quét chứng chỉ SSL & WHOIS ngầm (sẽ cập nhật sau ~30 giây)..."

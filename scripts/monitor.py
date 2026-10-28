@@ -81,7 +81,7 @@ def extract_root_domain(hostname: str) -> str:
 
 
 def parse_any_date(val: Any) -> Optional[datetime.datetime]:
-    """Parse datetime from various formats (datetime object, list, ISO string, common WHOIS strings)."""
+    """Parse datetime from various formats (datetime object, list, timestamp, ISO string, VN WHOIS strings)."""
     if val is None:
         return None
     if isinstance(val, list):
@@ -90,6 +90,15 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
             if parsed:
                 return parsed
         return None
+    if isinstance(val, (int, float)):
+        try:
+            ts = float(val)
+            if ts > 1e11:  # milliseconds
+                ts = ts / 1000.0
+            if ts > 0:
+                return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        except Exception:
+            return None
     if isinstance(val, datetime.datetime):
         if val.tzinfo is None:
             return val.replace(tzinfo=datetime.timezone.utc)
@@ -100,6 +109,9 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
         s = val.strip()
         if not s:
             return None
+        # Handle numeric string timestamp
+        if s.isdigit() and len(s) >= 10:
+            return parse_any_date(int(s))
         # Handle trailing Z or timezone offsets
         s_clean = re.sub(r"\s+\([A-Z]+\)$", "", s)
         if s_clean.endswith("Z"):
@@ -113,11 +125,13 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
             pass
 
         formats = [
+            "%d-%m-%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d",
             "%d-%m-%Y",
             "%d/%m/%Y",
+            "%Y-%m-%d",
             "%Y/%m/%d",
             "%d-%b-%Y",
             "%d.%m.%Y",
@@ -132,7 +146,50 @@ def parse_any_date(val: Any) -> Optional[datetime.datetime]:
                 return dt.replace(tzinfo=datetime.timezone.utc)
             except ValueError:
                 continue
+
+        # Regex fallback for DD-MM-YYYY or DD/MM/YYYY or YYYY-MM-DD embedded in text
+        m_dmy = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})\b", s)
+        if m_dmy:
+            try:
+                d, m, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
+                return datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc)
+            except ValueError:
+                pass
+        m_ymd = re.search(r"\b(20\d{2}|19\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", s)
+        if m_ymd:
+            try:
+                y, m, d = int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))
+                return datetime.datetime(y, m, d, tzinfo=datetime.timezone.utc)
+            except ValueError:
+                pass
     return None
+
+
+def normalize_registrar_name(registrar: Optional[str], nameservers: Optional[List[str]] = None) -> Optional[str]:
+    """Normalize Vietnamese & International registrar names (especially Mắt Bão & Tenten)."""
+    reg = (registrar or "").strip()
+    ns_str = " ".join(nameservers or []).lower()
+
+    reg_lower = reg.lower()
+    if "mắt bão" in reg_lower or "mat bao" in reg_lower or "matbao" in reg_lower:
+        return f"Mắt Bão ({reg})" if "mắt bão" not in reg_lower else reg
+    if "gmo-z.com" in reg_lower or "runsystem" in reg_lower or "tenten" in reg_lower:
+        return "Tenten.vn (GMO-Z.com RUNSYSTEM)"
+    if "p.a việt nam" in reg_lower or "p.a viet nam" in reg_lower or "pavietnam" in reg_lower:
+        return "P.A Việt Nam"
+    if "nhân hòa" in reg_lower or "nhan hoa" in reg_lower or "nhanhoa" in reg_lower:
+        return "Nhân Hòa"
+
+    if not reg:
+        if "matbao" in ns_str:
+            return "Mắt Bão (Theo Nameserver)"
+        if "tenten" in ns_str or "z.com" in ns_str:
+            return "Tenten.vn (Theo Nameserver)"
+        if "pavietnam" in ns_str:
+            return "P.A Việt Nam (Theo Nameserver)"
+        if "nhanhoa" in ns_str:
+            return "Nhân Hòa (Theo Nameserver)"
+    return reg or None
 
 
 def classify_status(days_left: Optional[int], warn_days: int, crit_days: int, has_error: bool = False) -> str:
@@ -447,6 +504,134 @@ def query_raw_whois_socket(root_domain: str, timeout: int = 8) -> Optional[Dict[
     return None
 
 
+def query_vn_registrar_whois(root_domain: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    """
+    Query Vietnamese accredited VNNIC registrar WHOIS gateways (works for all .vn domains
+    bought at Mắt Bão, Tenten, PA Việt Nam, Nhân Hòa, iNET, etc., as well as international TLDs).
+    """
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://whois.inet.vn/",
+    }
+
+    # 1. Primary VNNIC / Registrar JSON Gateway (whois.inet.vn)
+    try:
+        url = f"https://whois.inet.vn/api/whois/domainspecify/{root_domain}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                if isinstance(data, dict):
+                    exp_raw = (
+                        data.get("expirationDate")
+                        or data.get("expireDate")
+                        or data.get("expiration_date")
+                        or data.get("registryExpiryDate")
+                    )
+                    reg_raw = (
+                        data.get("creationDate")
+                        or data.get("createDate")
+                        or data.get("creation_date")
+                        or data.get("issueDate")
+                    )
+                    exp_date = parse_any_date(exp_raw)
+                    reg_date = parse_any_date(reg_raw)
+                    registrar = data.get("registrar") or data.get("registrarName")
+
+                    raw_ns = data.get("nameServer") or data.get("nameServers") or data.get("nameservers") or []
+                    if isinstance(raw_ns, str):
+                        raw_ns = [x.strip() for x in re.split(r"[,;\s]+", raw_ns) if x.strip()]
+                    nameservers = [str(ns).lower().rstrip(".") for ns in raw_ns if ns][:6]
+
+                    # Also check rawtext if structured date was missing
+                    raw_text = str(data.get("rawtext") or data.get("rawText") or "")
+                    if not exp_date and raw_text:
+                        for pat in [
+                            r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn|paid-till)\s*:\s*([^\r\n]+)",
+                        ]:
+                            m = re.search(pat, raw_text, re.IGNORECASE)
+                            if m:
+                                exp_date = parse_any_date(m.group(1).strip())
+                                if exp_date:
+                                    break
+                    if not reg_date and raw_text:
+                        for pat in [
+                            r"(?:Creation Date|Created On|Issue Date|Ngày đăng ký|Ngày cấp)\s*:\s*([^\r\n]+)",
+                        ]:
+                            m = re.search(pat, raw_text, re.IGNORECASE)
+                            if m:
+                                reg_date = parse_any_date(m.group(1).strip())
+                                if reg_date:
+                                    break
+                    if not registrar and raw_text:
+                        for pat in [
+                            r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*:\s*([^\r\n]+)",
+                        ]:
+                            m = re.search(pat, raw_text, re.IGNORECASE)
+                            if m:
+                                registrar = m.group(1).strip()
+                                break
+
+                    if exp_date:
+                        return {
+                            "expiry_date": exp_date,
+                            "creation_date": reg_date,
+                            "registrar": normalize_registrar_name(str(registrar) if registrar else None, nameservers),
+                            "nameservers": nameservers,
+                            "source": "VNNIC / VN-WHOIS",
+                        }
+    except Exception:
+        pass
+
+    # 2. Secondary fallback via PA Vietnam WHOIS gateway
+    try:
+        url_pa = f"https://whois.pavietnam.vn/whois.php?domain={root_domain}&cmd=get_whois"
+        req_pa = urllib.request.Request(url_pa, headers=headers)
+        with urllib.request.urlopen(req_pa, timeout=timeout) as resp:
+            if resp.status == 200:
+                raw_html = resp.read().decode("utf-8", errors="replace")
+                clean_txt = re.sub(r"<[^>]+>", "\n", raw_html)
+                exp_date = None
+                for pat in [
+                    r"(?:Expiration Date|Expiry Date|Expired Date|Ngày hết hạn)\s*[:\-]?\s*([^\r\n]+)",
+                ]:
+                    m = re.search(pat, clean_txt, re.IGNORECASE)
+                    if m:
+                        exp_date = parse_any_date(m.group(1).strip())
+                        if exp_date:
+                            break
+                reg_date = None
+                for pat in [
+                    r"(?:Creation Date|Issue Date|Ngày đăng ký|Ngày cấp)\s*[:\-]?\s*([^\r\n]+)",
+                ]:
+                    m = re.search(pat, clean_txt, re.IGNORECASE)
+                    if m:
+                        reg_date = parse_any_date(m.group(1).strip())
+                        if reg_date:
+                            break
+                registrar = None
+                for pat in [
+                    r"(?:Registrar|Nhà đăng ký quản lý|Nhà đăng ký)\s*[:\-]?\s*([^\r\n]+)",
+                ]:
+                    m = re.search(pat, clean_txt, re.IGNORECASE)
+                    if m:
+                        registrar = m.group(1).strip()
+                        break
+                if exp_date:
+                    return {
+                        "expiry_date": exp_date,
+                        "creation_date": reg_date,
+                        "registrar": normalize_registrar_name(registrar, []),
+                        "nameservers": [],
+                        "source": "VN-WHOIS (PA)",
+                    }
+    except Exception:
+        pass
+
+    return None
+
+
 def check_domain_registration(
     hostname: str,
     custom_expiry: str = "",
@@ -455,6 +640,7 @@ def check_domain_registration(
 ) -> Dict[str, Any]:
     """
     Checks domain WHOIS / RDAP expiration date, registrar, creation date, and nameservers.
+    Supports .vn domains (Mắt Bão, Tenten, PA, Nhân Hòa, iNET) and international TLDs.
     Supports manual override via custom_expiry (YYYY-MM-DD) for private/restricted TLDs.
     """
     root_domain = extract_root_domain(hostname)
@@ -477,17 +663,38 @@ def check_domain_registration(
     nameservers: List[str] = []
     source: Optional[str] = None
 
-    # 1. Try RDAP first (fast, structured, no rate-limit parsing issues)
-    rdap_info = query_rdap_domain(root_domain)
-    if rdap_info and rdap_info.get("expiry_date"):
-        exp_dt = rdap_info["expiry_date"]
-        reg_dt = rdap_info.get("creation_date")
-        registrar = rdap_info.get("registrar")
-        nameservers = rdap_info.get("nameservers") or []
-        source = rdap_info.get("source", "RDAP")
+    # 1. For .vn domains, query VNNIC / Vietnamese Registrar WHOIS API first
+    if root_domain.endswith(".vn"):
+        vn_info = query_vn_registrar_whois(root_domain)
+        if vn_info and vn_info.get("expiry_date"):
+            exp_dt = vn_info["expiry_date"]
+            reg_dt = vn_info.get("creation_date")
+            registrar = vn_info.get("registrar")
+            nameservers = vn_info.get("nameservers") or []
+            source = vn_info.get("source", "VNNIC WHOIS")
 
-    # 2. Fallback to python-whois
-    if exp_dt is None and HAS_PYWHOIS:
+    # 2. Try RDAP (fast, structured for .com, .net, .org, .io, .dev, etc.)
+    if exp_dt is None:
+        rdap_info = query_rdap_domain(root_domain)
+        if rdap_info and rdap_info.get("expiry_date"):
+            exp_dt = rdap_info["expiry_date"]
+            reg_dt = rdap_info.get("creation_date")
+            registrar = rdap_info.get("registrar")
+            nameservers = rdap_info.get("nameservers") or []
+            source = rdap_info.get("source", "RDAP")
+
+    # 3. Try Vietnamese Registrar WHOIS API as universal fallback for international domains bought on Tenten / Mắt Bão
+    if exp_dt is None and not root_domain.endswith(".vn"):
+        vn_fallback = query_vn_registrar_whois(root_domain)
+        if vn_fallback and vn_fallback.get("expiry_date"):
+            exp_dt = vn_fallback["expiry_date"]
+            reg_dt = vn_fallback.get("creation_date")
+            registrar = vn_fallback.get("registrar")
+            nameservers = vn_fallback.get("nameservers") or []
+            source = vn_fallback.get("source", "VN-WHOIS")
+
+    # 4. Fallback to python-whois (only for non-.vn domains since VNNIC disabled port 43)
+    if exp_dt is None and HAS_PYWHOIS and not root_domain.endswith(".vn"):
         try:
             w = pywhois.whois(root_domain)
             exp_dt = parse_any_date(getattr(w, "expiration_date", None) or w.get("expiration_date"))
@@ -506,8 +713,8 @@ def check_domain_registration(
         except Exception as exc:
             result["domain_error"] = f"WHOIS lookup warning: {exc}"
 
-    # 3. Fallback to raw socket WHOIS
-    if exp_dt is None:
+    # 5. Fallback to raw socket WHOIS
+    if exp_dt is None and not root_domain.endswith(".vn"):
         raw_info = query_raw_whois_socket(root_domain)
         if raw_info and raw_info.get("expiry_date"):
             exp_dt = raw_info["expiry_date"]
@@ -516,12 +723,14 @@ def check_domain_registration(
             nameservers = raw_info.get("nameservers") or nameservers
             source = raw_info.get("source", "Raw WHOIS")
 
-    # 4. Manual override (`custom_domain_expiry` in domains.json)
+    # 6. Manual override (`custom_domain_expiry` in domains.json)
     if custom_expiry and custom_expiry.strip():
         manual_dt = parse_any_date(custom_expiry.strip())
         if manual_dt:
             exp_dt = manual_dt
             source = "Manual Config" if not source else f"{source} + Manual"
+
+    registrar = normalize_registrar_name(registrar, nameservers)
 
     if exp_dt is not None:
         now = now_utc()
