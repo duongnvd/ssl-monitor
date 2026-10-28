@@ -1,0 +1,92 @@
+name: SSL & Domain Expiration Monitor
+
+on:
+  # Tự động chạy lúc 07:30 sáng giờ Việt Nam (00:30 UTC) mỗi ngày
+  schedule:
+    - cron: '30 0 * * *'
+
+  # Tự động quét lại ngay khi bạn Thêm / Sửa / Xóa domain trên giao diện Web
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'data/domains.json'
+
+  # Cho phép bấm nút "Quét ngay" hoặc "Gửi Email Test" từ giao diện Web
+  workflow_dispatch:
+    inputs:
+      force_email:
+        description: 'Gửi báo cáo Email ngay cả khi tất cả domain đều an toàn'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      test_email:
+        description: 'Gửi Email kiểm tra cấu hình Groupware / SMTP'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  scan-and-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SSL & Domain Scanner + Groupware Email Alerter
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_SECURITY: ${{ secrets.SMTP_SECURITY }}
+          SMTP_SKIP_TLS_VERIFY: ${{ secrets.SMTP_SKIP_TLS_VERIFY }}
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.force_email }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --force-email"
+          fi
+          if [ "${{ github.event.inputs.test_email }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --test-email"
+          fi
+          python scripts/monitor.py $EXTRA_ARGS
+
+      - name: Commit & Push updated results.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/results.json
+          if git diff --staged --quiet; then
+            echo "Không có thay đổi trong data/results.json"
+          else
+            git commit -m "chore(monitor): cập nhật kết quả quét SSL & Domain [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }}
+            git push origin HEAD:${{ github.ref_name }}
+          fi

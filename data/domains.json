@@ -1,0 +1,49 @@
+{
+  "settings": {
+    "alert_days_ssl": 30,
+    "critical_days_ssl": 7,
+    "alert_days_domain": 30,
+    "critical_days_domain": 14,
+    "notify_mode": "alert_only",
+    "weekly_digest_day": "monday",
+    "default_recipients": [
+      "admin@example.com"
+    ],
+    "dashboard_url": "https://duongnvd.github.io/ssl-monitor/"
+  },
+  "domains": [
+    {
+      "id": "dom-1",
+      "domain": "github.com",
+      "port": 443,
+      "group": "Core Services",
+      "notes": "GitHub Repository & Pages",
+      "check_ssl": true,
+      "check_domain": true,
+      "notify_emails": [],
+      "custom_domain_expiry": ""
+    },
+    {
+      "id": "dom-2",
+      "domain": "google.com",
+      "port": 443,
+      "group": "External",
+      "notes": "DNS & Search",
+      "check_ssl": true,
+      "check_domain": true,
+      "notify_emails": [],
+      "custom_domain_expiry": ""
+    },
+    {
+      "id": "dom-3",
+      "domain": "cloudflare.com",
+      "port": 443,
+      "group": "Infrastructure",
+      "notes": "CDN & DNS Provider",
+      "check_ssl": true,
+      "check_domain": true,
+      "notify_emails": [],
+      "custom_domain_expiry": ""
+    }
+  ]
+}

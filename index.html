@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="vi" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSL &amp; Domain Monitor — Sysadmin Dashboard</title>
+  <link rel="stylesheet" href="./assets/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
+</head>
+<body>
+  <!-- Top Header -->
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <div class="brand-icon">🛡️</div>
+        <div>
+          <div class="brand-title-row">
+            <h1>SSL &amp; Domain Monitor</h1>
+            <span id="syncModeBadge" class="mode-badge mode-readonly" title="Trạng thái kết nối GitHub API">Chế độ Xem (Chưa gắn Token)</span>
+          </div>
+          <p class="brand-sub">
+            Hệ thống giám sát hạn chứng chỉ SSL &amp; tên miền dành cho Sysadmin •
+            <span id="lastUpdatedText">Đang tải dữ liệu...</span>
+          </p>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="btnRunCheckNow" class="btn btn-secondary" title="Kích hoạt GitHub Actions quét toàn bộ SSL & Domain ngay lập tức">
+          <span>🔄</span> Quét ngay
+        </button>
+        <button id="btnBulkAdd" class="btn btn-secondary" title="Nhập nhanh danh sách nhiều tên miền">
+          <span>📋</span> Nhập hàng loạt
+        </button>
+        <button id="btnAddDomain" class="btn btn-primary">
+          <span>➕</span> Thêm Domain
+        </button>
+        <button id="btnSettings" class="btn btn-icon" title="Cấu hình cảnh báo Email Groupware & GitHub Token">
+          ⚙️ Cấu hình &amp; Email
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-content">
+    <!-- Notification Banner for workflow status or local mode -->
+    <div id="statusBanner" class="status-banner hidden">
+      <span id="statusBannerText"></span>
+      <button id="statusBannerClose" class="banner-close">✕</button>
+    </div>
+
+    <!-- Summary KPI Cards -->
+    <section class="kpi-grid">
+      <div class="kpi-card kpi-total" data-filter="all">
+        <div class="kpi-header">
+          <span class="kpi-label">Tổng số Domain</span>
+          <span class="kpi-icon">🌐</span>
+        </div>
+        <div class="kpi-value" id="kpiTotal">0</div>
+        <div class="kpi-foot">Đang theo dõi SSL &amp; WHOIS</div>
+      </div>
+
+      <div class="kpi-card kpi-healthy" data-filter="ok">
+        <div class="kpi-header">
+          <span class="kpi-label">An toàn (&gt; 30 ngày)</span>
+          <span class="kpi-icon">✅</span>
+        </div>
+        <div class="kpi-value" id="kpiHealthy">0</div>
+        <div class="kpi-foot">Chứng chỉ &amp; tên miền ổn định</div>
+      </div>
+
+      <div class="kpi-card kpi-warning" data-filter="warning">
+        <div class="kpi-header">
+          <span class="kpi-label">Sắp hết hạn (≤ 30 ngày)</span>
+          <span class="kpi-icon">⚠️</span>
+        </div>
+        <div class="kpi-value" id="kpiWarning">0</div>
+        <div class="kpi-foot" id="kpiWarningDetail">Cần lên kế hoạch gia hạn</div>
+      </div>
+
+      <div class="kpi-card kpi-critical" data-filter="critical">
+        <div class="kpi-header">
+          <span class="kpi-label">Khẩn cấp / Lỗi (≤ 7 ngày)</span>
+          <span class="kpi-icon">🚨</span>
+        </div>
+        <div class="kpi-value" id="kpiCritical">0</div>
+        <div class="kpi-foot">Đã gửi cảnh báo qua Email</div>
+      </div>
+    </section>
+
+    <!-- Toolbar: Search, Filter, Sort, Export -->
+    <section class="toolbar">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input
+          type="text"
+          id="searchInput"
+          placeholder="Tìm theo tên miền, IP, CA Issuer, Registrar, nhóm hoặc ghi chú..."
+        />
+      </div>
+
+      <div class="toolbar-controls">
+        <select id="filterStatus" class="select-input">
+          <option value="all">Tất cả trạng thái</option>
+          <option value="attention">⚠️ Cần chú ý (Sắp/Đã hết hạn &amp; Lỗi)</option>
+          <option value="ssl_expiring">🔒 SSL sắp/đã hết hạn</option>
+          <option value="domain_expiring">🌍 Domain sắp/đã hết hạn</option>
+          <option value="ok">✅ Đang an toàn</option>
+        </select>
+
+        <select id="filterGroup" class="select-input">
+          <option value="all">Tất cả nhóm</option>
+        </select>
+
+        <select id="sortBy" class="select-input">
+          <option value="urgency">Sắp xếp: Ưu tiên cảnh báo</option>
+          <option value="ssl_asc">Hạn SSL: Còn ít ngày nhất</option>
+          <option value="domain_asc">Hạn Domain: Còn ít ngày nhất</option>
+          <option value="domain_name">Tên miền (A → Z)</option>
+        </select>
+
+        <button id="btnExportCsv" class="btn btn-secondary btn-sm" title="Xuất báo cáo ra file CSV (Excel)">
+          📥 Xuất CSV
+        </button>
+      </div>
+    </section>
+
+    <!-- Domains Monitoring Table -->
+    <section class="table-card">
+      <div class="table-responsive">
+        <table class="monitor-table">
+          <thead>
+            <tr>
+              <th style="width: 25%">Tên miền &amp; Hệ thống</th>
+              <th style="width: 31%">Chứng chỉ SSL / TLS</th>
+              <th style="width: 28%">Hạn Tên miền (WHOIS / RDAP)</th>
+              <th style="width: 16%; text-align: right">Thao tác</th>
+            </tr>
+          </thead>
+          <tbody id="domainTableBody">
+            <tr>
+              <td colspan="4" class="empty-state">Đang tải danh sách tên miền...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer container">
+    <div>
+      <strong>SSL &amp; Domain Expiration Monitor</strong> • Chạy tự động trên GitHub Pages &amp; GitHub Actions •
+      Cảnh báo qua Email Server (Groupware / SMTP)
+    </div>
+    <div class="footer-links">
+      <a href="#" id="linkOpenSetupGuide">📖 Hướng dẫn cấu hình Groupware SMTP &amp; GitHub Pages</a>
+    </div>
+  </footer>
+
+  <!-- MODAL 1: Add / Edit Domain -->
+  <div id="modalDomain" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2 id="modalDomainTitle">➕ Thêm Tên miền theo dõi</h2>
+        <button class="modal-close" data-close="modalDomain">✕</button>
+      </div>
+      <form id="formDomain" class="modal-body">
+        <input type="hidden" id="domainId" />
+
+        <div class="form-row-2">
+          <div class="form-group">
+            <label for="inputDomain">Tên miền / Subdomain <span class="req">*</span></label>
+            <input
+              type="text"
+              id="inputDomain"
+              required
+              placeholder="VD: mail.congty.com.vn hoặc duongnvd.github.io"
+            />
+            <small class="form-hint">Tự động lọc bỏ https:// và lấy domain gốc khi tra WHOIS</small>
+          </div>
+
+          <div class="form-group">
+            <label for="inputPort">Cổng SSL (Port)</label>
+            <input type="number" id="inputPort" value="443" min="1" max="65535" />
+            <small class="form-hint">Mặc định 443 (hoặc 465/587/993/8443 cho Mail/Web)</small>
+          </div>
+        </div>
+
+        <div class="form-row-2">
+          <div class="form-group">
+            <label for="inputGroup">Nhóm hệ thống (Group / Tag)</label>
+            <input
+              type="text"
+              id="inputGroup"
+              list="groupSuggestions"
+              placeholder="VD: Production, Mail Groupware, Khách hàng..."
+            />
+            <datalist id="groupSuggestions">
+              <option value="Production"></option>
+              <option value="Mail Groupware"></option>
+              <option value="Core Services"></option>
+              <option value="Infrastructure"></option>
+              <option value="Internal"></option>
+            </datalist>
+          </div>
+
+          <div class="form-group">
+            <label for="inputCustomExpiry">Ngày hết hạn Domain thủ công (Tùy chọn)</label>
+            <input type="date" id="inputCustomExpiry" />
+            <small class="form-hint">Dùng khi tên miền bị ẩn WHOIS hoặc muốn tự chỉ định</small>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="inputNotes">Ghi chú vận hành (Notes)</label>
+          <input
+            type="text"
+            id="inputNotes"
+            placeholder="VD: Gia hạn tại Nhân Hòa / Mắt Bão, dùng Let's Encrypt auto-renew..."
+          />
+        </div>
+
+        <div class="form-group">
+          <label for="inputNotifyEmails">Email nhận cảnh báo bổ sung cho domain này (Tùy chọn)</label>
+          <input
+            type="text"
+            id="inputNotifyEmails"
+            placeholder="VD: devops@congty.com, it-team@congty.com (cách nhau dấu phẩy)"
+          />
+          <small class="form-hint">Để trống sẽ gửi về danh sách Email nhận mặc định của hệ thống</small>
+        </div>
+
+        <div class="checkbox-row">
+          <label class="checkbox-label">
+            <input type="checkbox" id="inputCheckSsl" checked />
+            <span>Kiểm tra chứng chỉ SSL/TLS</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="inputCheckDomain" checked />
+            <span>Kiểm tra ngày hết hạn Domain (WHOIS/RDAP)</span>
+          </label>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modalDomain">Hủy</button>
+          <button type="submit" id="btnSaveDomain" class="btn btn-primary">💾 Lưu &amp; Kiểm tra</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL 2: Bulk Import Domains -->
+  <div id="modalBulk" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h2>📋 Nhập hàng loạt Tên miền</h2>
+        <button class="modal-close" data-close="modalBulk">✕</button>
+      </div>
+      <form id="formBulk" class="modal-body">
+        <div class="form-group">
+          <label for="bulkTextarea">Dán danh sách tên miền (mỗi dòng 1 tên miền)</label>
+          <textarea
+            id="bulkTextarea"
+            rows="8"
+            placeholder="example.com&#10;mail.company.com.vn:443, Mail Groupware, Server mail công ty&#10;portal.company.vn, Production, Cổng nội bộ"
+          ></textarea>
+          <small class="form-hint">
+            Định dạng hỗ trợ mỗi dòng: <code>domain[:port]</code> hoặc <code>domain[:port], Nhóm, Ghi chú</code>
+          </small>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modalBulk">Đóng</button>
+          <button type="submit" class="btn btn-primary">➕ Thêm tất cả vào danh sách</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL 3: Domain & SSL Detail Inspector -->
+  <div id="modalDetail" class="modal-overlay hidden">
+    <div class="modal-box modal-lg">
+      <div class="modal-header">
+        <h2 id="detailTitle">🔍 Chi tiết Tên miền &amp; SSL</h2>
+        <button class="modal-close" data-close="modalDetail">✕</button>
+      </div>
+      <div id="detailBody" class="modal-body"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-close="modalDetail">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 4: Settings, GitHub Token & Corporate Groupware SMTP Setup -->
+  <div id="modalSettings" class="modal-overlay hidden">
+    <div class="modal-box modal-lg">
+      <div class="modal-header">
+        <h2>⚙️ Cấu hình Hệ thống, GitHub API &amp; Email Groupware</h2>
+        <button class="modal-close" data-close="modalSettings">✕</button>
+      </div>
+      <form id="formSettings" class="modal-body">
+        <!-- Section A: GitHub Connection -->
+        <div class="settings-section">
+          <h3>1. Kết nối GitHub Repository (Để lưu Domain trực tiếp từ Web UI)</h3>
+          <p class="section-desc">
+            Thông tin Token chỉ lưu cục bộ trên trình duyệt của bạn (<code>localStorage</code>), tuyệt đối không đẩy lên mạng.
+            Khi bạn thêm/xóa domain, Web sẽ gọi GitHub API cập nhật file <code>data/domains.json</code> và tự động chạy GitHub Actions.
+          </p>
+          <div class="form-row-3">
+            <div class="form-group">
+              <label for="cfgGhOwner">GitHub Username / Org</label>
+              <input type="text" id="cfgGhOwner" placeholder="duongnvd" value="duongnvd" />
+            </div>
+            <div class="form-group">
+              <label for="cfgGhRepo">Tên Repository</label>
+              <input type="text" id="cfgGhRepo" placeholder="ssl-monitor" value="ssl-monitor" />
+            </div>
+            <div class="form-group">
+              <label for="cfgGhBranch">Branch</label>
+              <input type="text" id="cfgGhBranch" placeholder="main" value="main" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="cfgGhToken">GitHub Personal Access Token (PAT - Quyền <code>repo</code> hoặc <code>Contents: Read &amp; Write</code> + <code>Actions: Write</code>)</label>
+            <input
+              type="password"
+              id="cfgGhToken"
+              placeholder="ghp_xxxxxxxxxxxxxxxxxxxx hoặc github_pat_xxxxxxxx..."
+            />
+            <small class="form-hint">
+              Tạo nhanh tại: <a href="https://github.com/settings/tokens/new?scopes=repo,workflow&description=SSL-Domain-Monitor" target="_blank" rel="noopener">GitHub Settings → Personal Access Tokens</a>
+            </small>
+          </div>
+        </div>
+
+        <!-- Section B: Alert Thresholds & Recipients -->
+        <div class="settings-section">
+          <h3>2. Ngưỡng cảnh báo gia hạn &amp; Danh sách Email nhận thông báo</h3>
+          <div class="form-row-2">
+            <div class="form-group">
+              <label for="cfgAlertSsl">Cảnh báo sớm SSL trước (ngày)</label>
+              <input type="number" id="cfgAlertSsl" value="30" min="1" max="365" />
+            </div>
+            <div class="form-group">
+              <label for="cfgCritSsl">Cảnh báo khẩn cấp SSL trước (ngày)</label>
+              <input type="number" id="cfgCritSsl" value="7" min="1" max="180" />
+            </div>
+          </div>
+
+          <div class="form-row-2">
+            <div class="form-group">
+              <label for="cfgAlertDomain">Cảnh báo sớm Tên miền trước (ngày)</label>
+              <input type="number" id="cfgAlertDomain" value="30" min="1" max="365" />
+            </div>
+            <div class="form-group">
+              <label for="cfgCritDomain">Cảnh báo khẩn cấp Tên miền trước (ngày)</label>
+              <input type="number" id="cfgCritDomain" value="14" min="1" max="180" />
+            </div>
+          </div>
+
+          <div class="form-row-2">
+            <div class="form-group">
+              <label for="cfgNotifyMode">Chế độ gửi Email định kỳ</label>
+              <select id="cfgNotifyMode" class="select-input" style="width: 100%">
+                <option value="alert_only">Chỉ gửi Email khi có SSL/Domain sắp hết hạn hoặc lỗi</option>
+                <option value="daily_digest">Gửi báo cáo tổng hợp mỗi ngày (kể cả khi an toàn)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="cfgDefaultEmails">Email nhận thông báo mặc định (cách nhau dấu phẩy)</label>
+              <input
+                type="text"
+                id="cfgDefaultEmails"
+                placeholder="sysadmin@congty.com, duongnvd@congty.com"
+              />
+            </div>
+          </div>
+        </div>
+
+        <!-- Section C: Groupware Mail Server Guide & Test Button -->
+        <div class="settings-section">
+          <h3>3. Cấu hình Mail Server Công ty (Groupware SMTP / Gmail) trong GitHub Secrets</h3>
+          <p class="section-desc">
+            Để bảo mật mật khẩu Email Groupware của công ty, thông tin đăng nhập SMTP được lưu trong
+            <strong>GitHub Repository → Settings → Secrets and variables → Actions → New repository secret</strong>:
+          </p>
+          <div class="secrets-table-wrap">
+            <table class="secrets-table">
+              <thead>
+                <tr>
+                  <th>Tên Secret</th>
+                  <th>Giá trị mẫu (Groupware Công ty)</th>
+                  <th>Giá trị mẫu (Gmail)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>SMTP_HOST</code></td>
+                  <td><code>mail.tencongty.com</code> (hoặc IP mail server)</td>
+                  <td><code>smtp.gmail.com</code></td>
+                </tr>
+                <tr>
+                  <td><code>SMTP_PORT</code></td>
+                  <td><code>587</code> (STARTTLS), <code>465</code> (SSL) hoặc <code>25</code></td>
+                  <td><code>587</code></td>
+                </tr>
+                <tr>
+                  <td><code>SMTP_USER</code></td>
+                  <td><code>alert@tencongty.com</code></td>
+                  <td><code>youremail@gmail.com</code></td>
+                </tr>
+                <tr>
+                  <td><code>SMTP_PASS</code></td>
+                  <td>Mật khẩu tài khoản Groupware</td>
+                  <td>App Password (16 ký tự)</td>
+                </tr>
+                <tr>
+                  <td><code>SMTP_FROM</code></td>
+                  <td><code>SSL Monitor &lt;alert@tencongty.com&gt;</code></td>
+                  <td><code>SSL Monitor &lt;youremail@gmail.com&gt;</code></td>
+                </tr>
+                <tr>
+                  <td><code>SMTP_SKIP_TLS_VERIFY</code></td>
+                  <td><code>true</code> (nếu mail nội bộ dùng cert tự ký)</td>
+                  <td><code>false</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="test-email-bar">
+            <span>Sau khi thêm Secrets trên GitHub, bạn có thể bấm nút bên cạnh để kiểm tra nhận mail ngay:</span>
+            <button type="button" id="btnTriggerTestEmail" class="btn btn-secondary btn-sm">
+              ✉️ Gửi Email Test qua GitHub Actions
+            </button>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modalSettings">Đóng</button>
+          <button type="submit" class="btn btn-primary">💾 Lưu Cấu hình</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="./assets/app.js"></script>
+</body>
+</html>
