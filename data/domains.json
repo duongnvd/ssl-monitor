@@ -22,17 +22,6 @@
       "custom_domain_expiry": ""
     },
     {
-      "id": "dom-3",
-      "domain": "cloudflare.com",
-      "port": 443,
-      "group": "Infrastructure",
-      "notes": "CDN & DNS Provider",
-      "check_ssl": true,
-      "check_domain": true,
-      "notify_emails": [],
-      "custom_domain_expiry": ""
-    },
-    {
       "id": "dom-1793174470570",
       "domain": "vtimgroup.vn",
       "port": 5555,
