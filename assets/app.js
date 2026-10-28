@@ -1,5 +1,5 @@
 /**
- * SSL & Domain Monitor — Frontend Application
+ * SSL & Domain Monitor — DashStack Admin UI Application
  * Works on GitHub Pages (https://duongnvd.github.io/ssl-monitor/) and local environments.
  */
 
@@ -7,6 +7,7 @@ const STORAGE_KEYS = {
   GH_CONFIG: "ssl_monitor_gh_config_v1",
   LOCAL_DOMAINS: "ssl_monitor_local_domains_v1",
   LOCAL_RESULTS: "ssl_monitor_local_results_v1",
+  THEME: "ssl_monitor_ds_theme_v1",
 };
 
 const MULTI_PART_TLDS = new Set([
@@ -73,8 +74,8 @@ function base64ToUtf8(b64) {
 function showBanner(msg, isError = false) {
   const banner = document.getElementById("statusBanner");
   const text = document.getElementById("statusBannerText");
-  banner.style.borderColor = isError ? "rgba(239,68,68,0.55)" : "rgba(59,130,246,0.45)";
-  banner.style.background = isError ? "rgba(239,68,68,0.18)" : "rgba(37,99,235,0.18)";
+  banner.style.borderColor = isError ? "rgba(239,56,38,0.5)" : "rgba(72,128,255,0.4)";
+  banner.style.background = isError ? "rgba(239,56,38,0.12)" : "rgba(72,128,255,0.12)";
   text.innerHTML = msg;
   banner.classList.remove("hidden");
 }
@@ -99,6 +100,20 @@ function computeOverallStatus(sslStatus, domStatus) {
   return "ok";
 }
 
+// Theme Handling (DashStack Light default + Dark Mode toggle)
+function initTheme() {
+  const savedTheme = localStorage.getItem(STORAGE_KEYS.THEME) || "light";
+  applyTheme(savedTheme);
+}
+
+function applyTheme(theme) {
+  const isDark = theme === "dark";
+  document.body.classList.toggle("dark-theme", isDark);
+  const iconEl = document.getElementById("themeIcon");
+  if (iconEl) iconEl.textContent = isDark ? "☀️" : "🌙";
+  localStorage.setItem(STORAGE_KEYS.THEME, isDark ? "dark" : "light");
+}
+
 // Auto-detect GitHub Repo from URL
 function initGitHubConfig() {
   const saved = localStorage.getItem(STORAGE_KEYS.GH_CONFIG);
@@ -119,12 +134,13 @@ function initGitHubConfig() {
 
 function updateSyncBadge() {
   const badge = document.getElementById("syncModeBadge");
+  if (!badge) return;
   if (state.ghConfig.token) {
-    badge.className = "mode-badge mode-connected";
-    badge.textContent = `🔗 Đã kết nối: ${state.ghConfig.owner}/${state.ghConfig.repo}`;
+    badge.className = "ds-sync-pill mode-connected";
+    badge.textContent = `● GitHub: ${state.ghConfig.owner}/${state.ghConfig.repo}`;
   } else {
-    badge.className = "mode-badge mode-readonly";
-    badge.textContent = "⚡ Chế độ Trình duyệt (Bấm Cấu hình để gắn GitHub Token)";
+    badge.className = "ds-sync-pill mode-readonly";
+    badge.textContent = "⚡ Chưa gắn Token (Bấm để cấu hình)";
   }
 }
 
@@ -136,7 +152,6 @@ async function loadAllData() {
     let resultsJson = null;
 
     if (state.ghConfig.token) {
-      // Load fresh from GitHub API to avoid CDN caching delay
       try {
         const domFile = await githubGetFile("data/domains.json");
         if (domFile && domFile.content) {
@@ -161,7 +176,6 @@ async function loadAllData() {
       if (r2.ok) resultsJson = await r2.json();
     }
 
-    // If user is in local mode (no token) and has local additions, merge them
     if (!state.ghConfig.token) {
       const localDom = localStorage.getItem(STORAGE_KEYS.LOCAL_DOMAINS);
       const localRes = localStorage.getItem(STORAGE_KEYS.LOCAL_RESULTS);
@@ -180,10 +194,6 @@ async function loadAllData() {
   }
 }
 
-/**
- * Ensures any domain present in domainsConfig.domains also appears in resultsData.items
- * even if GitHub Actions hasn't finished scanning it yet.
- */
 function mergeConfigIntoResults() {
   const existingMap = new Map();
   for (const item of state.resultsData.items || []) {
@@ -238,7 +248,7 @@ function mergeConfigIntoResults() {
         domain_status: "unknown",
         domain_days_left: null,
         domain_expiry_date: d.custom_domain_expiry || null,
-        domain_registrar: "Đang tra cứu RDAP...",
+        domain_registrar: "Đang tra cứu VNNIC / RDAP...",
         overall_status: "unknown",
       });
     }
@@ -269,7 +279,6 @@ function parseFlexibleDate(raw) {
   }
   const s = String(raw).trim();
   if (!s) return null;
-  // Match DD-MM-YYYY or DD/MM/YYYY
   const mDmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](20\d{2}|19\d{2})/);
   if (mDmy) {
     const d = new Date(Date.UTC(Number(mDmy[3]), Number(mDmy[2]) - 1, Number(mDmy[1])));
@@ -304,10 +313,6 @@ function normalizeRegistrar(reg, nameservers = []) {
   return r || null;
 }
 
-/**
- * Live Browser-Side Lookup (DNS-over-HTTPS + VN-WHOIS + RDAP) so when a sysadmin adds a domain,
- * they immediately see the IP and Domain WHOIS/RDAP expiration without waiting!
- */
 async function performBrowserLiveCheck(domainEntry) {
   const host = cleanHostname(domainEntry.domain);
   const port = Number(domainEntry.port || 443);
@@ -345,11 +350,10 @@ async function performBrowserLiveCheck(domainEntry) {
     }
   } catch (_) {}
 
-  // 2. Query VN-WHOIS & RDAP in browser for Domain Expiry Date & Registrar
+  // 2. Query VN-WHOIS & RDAP in browser
   if (domainEntry.check_domain !== false) {
     let foundWhois = false;
 
-    // 2a. Try VN-WHOIS gateway (supports .vn & international domains on Mắt Bão / Tenten)
     try {
       const vnResp = await fetch(`https://whois.inet.vn/api/whois/domainspecify/${encodeURIComponent(rootDomain)}`);
       if (vnResp.ok) {
@@ -383,7 +387,6 @@ async function performBrowserLiveCheck(domainEntry) {
       }
     } catch (_) {}
 
-    // 2b. Fallback to RDAP (for international domains)
     if (!foundWhois && !rootDomain.endsWith(".vn")) {
       try {
         const rdapUrls = [`https://rdap.org/domain/${encodeURIComponent(rootDomain)}`];
@@ -454,7 +457,7 @@ async function performBrowserLiveCheck(domainEntry) {
   renderAll();
 }
 
-// GitHub API Helpers
+// GitHub API Helpers (with Anti-409 Conflict Queue & Retry)
 async function githubApiRequest(endpoint, options = {}) {
   const { owner, repo, token } = state.ghConfig;
   if (!token) throw new Error("Chưa cấu hình GitHub Personal Access Token");
@@ -493,11 +496,10 @@ function saveDomainsConfig(commitMessage) {
 
 async function performSaveDomainsConfig(commitMessage) {
   if (!state.ghConfig.token) {
-    // Save locally in browser localStorage if no GitHub Token is set yet
     localStorage.setItem(STORAGE_KEYS.LOCAL_DOMAINS, JSON.stringify(state.domainsConfig));
     localStorage.setItem(STORAGE_KEYS.LOCAL_RESULTS, JSON.stringify(state.resultsData));
     showBanner(
-      "💡 Đã lưu tạm trên trình duyệt và tra cứu RDAP trực tiếp! Để lưu vĩnh viễn lên GitHub & quét SSL tự động + gửi Email, hãy bấm <strong>⚙️ Cấu hình & Email</strong> để gắn GitHub Token."
+      "💡 Đã lưu tạm trên trình duyệt và tra cứu trực tiếp! Để lưu vĩnh viễn lên GitHub & quét SSL tự động + gửi Email, hãy bấm <strong>⚙️ Cấu hình & Email</strong> để gắn GitHub Token."
     );
     return;
   }
@@ -532,7 +534,6 @@ async function performSaveDomainsConfig(commitMessage) {
       break;
     } catch (err) {
       const errMsg = String(err.message || "");
-      // Nếu gặp lỗi 409 Conflict do SHA cũ, tự động bóc SHA mới nhất từ thông báo lỗi của GitHub và thử lại ngay
       const matchSha = errMsg.match(/does not match ([0-9a-f]{40})/i);
       if (matchSha && attempt < maxAttempts) {
         sha = matchSha[1];
@@ -607,11 +608,24 @@ function renderKpis() {
   document.getElementById("kpiWarning").textContent = s.warning || 0;
   document.getElementById("kpiCritical").textContent = s.critical || 0;
 
+  const attentionCount = (s.warning || 0) + (s.critical || 0);
+  const bellEl = document.getElementById("bellCount");
+  if (bellEl) bellEl.textContent = attentionCount;
+
+  const navAttEl = document.getElementById("navBadgeAttention");
+  if (navAttEl) navAttEl.textContent = attentionCount;
+
+  const navSslEl = document.getElementById("navBadgeSsl");
+  if (navSslEl) navSslEl.textContent = s.ssl_expiring || 0;
+
+  const navDomEl = document.getElementById("navBadgeDomain");
+  if (navDomEl) navDomEl.textContent = s.domain_expiring || 0;
+
   const lastUpd = state.resultsData.last_updated;
   const lastUpdEl = document.getElementById("lastUpdatedText");
   if (lastUpd) {
     const dt = new Date(lastUpd);
-    lastUpdEl.textContent = `Cập nhật lần cuối: ${isNaN(dt) ? lastUpd : dt.toLocaleString("vi-VN")}`;
+    lastUpdEl.textContent = `Cập nhật lần cuối: ${isNaN(dt) ? lastUpd : dt.toLocaleString("vi-VN")} • Quét tự động 07:30 sáng hàng ngày`;
   } else {
     lastUpdEl.textContent = "Chưa có dữ liệu quét";
   }
@@ -628,13 +642,13 @@ function renderGroupFilterOptions() {
   for (const g of groups) {
     const opt = document.createElement("option");
     opt.value = g;
-    opt.textContent = `📁 ${g}`;
+    opt.textContent = `Nhóm: ${g}`;
     select.appendChild(opt);
   }
   if (groups.includes(currentVal)) select.value = currentVal;
 }
 
-function formatStatusBadge(status, daysLeft, isSsl = true) {
+function formatStatusBadge(status, daysLeft) {
   const labelMap = {
     ok: "An toàn",
     warning: "Sắp hết hạn",
@@ -644,29 +658,19 @@ function formatStatusBadge(status, daysLeft, isSsl = true) {
     unknown: "Đang chờ quét",
     skipped: "Bỏ qua",
   };
-  const iconMap = {
-    ok: "🟢",
-    warning: "🟡",
-    critical: "🔴",
-    expired: "⛔",
-    error: "❌",
-    unknown: "⏳",
-    skipped: "➖",
-  };
   const st = status || "unknown";
-  const icon = iconMap[st] || "⏳";
   let text = labelMap[st] || st;
   if (daysLeft !== null && daysLeft !== undefined) {
     text = daysLeft < 0 ? `Quá hạn ${Math.abs(daysLeft)} ngày` : `Còn ${daysLeft} ngày`;
   }
-  return `<span class="badge badge-${st}">${icon} ${text}</span>`;
+  return `<span class="badge badge-${st}">${text}</span>`;
 }
 
 function formatProgressBar(status, daysLeft, maxDays = 90) {
   if (daysLeft === null || daysLeft === undefined) {
     return `<div class="progress-track"><div class="progress-fill" style="width:0%"></div></div>`;
   }
-  const pct = Math.max(4, Math.min(100, Math.round((Math.max(0, daysLeft) / maxDays) * 100)));
+  const pct = Math.max(5, Math.min(100, Math.round((Math.max(0, daysLeft) / maxDays) * 100)));
   const st = status || "ok";
   return `<div class="progress-track"><div class="progress-fill fill-${st}" style="width:${pct}%"></div></div>`;
 }
@@ -688,7 +692,6 @@ function renderTable() {
 
   let list = [...(state.resultsData.items || [])];
 
-  // Filter by search text
   if (query) {
     list = list.filter((it) => {
       const hay = [
@@ -707,7 +710,6 @@ function renderTable() {
     });
   }
 
-  // Filter by status
   if (statusFilter === "attention") {
     list = list.filter((it) => ["warning", "critical", "expired", "error"].includes(it.overall_status));
   } else if (statusFilter === "ssl_expiring") {
@@ -718,12 +720,10 @@ function renderTable() {
     list = list.filter((it) => it.overall_status === "ok");
   }
 
-  // Filter by group
   if (groupFilter !== "all") {
     list = list.filter((it) => (it.group || "Default") === groupFilter);
   }
 
-  // Sort
   const statusRank = { expired: 0, error: 1, critical: 2, warning: 3, ok: 4, unknown: 5, skipped: 6 };
   list.sort((a, b) => {
     if (sortBy === "ssl_asc") {
@@ -735,7 +735,6 @@ function renderTable() {
     if (sortBy === "domain_name") {
       return a.domain.localeCompare(b.domain);
     }
-    // Default: urgency
     const rA = statusRank[a.overall_status] ?? 9;
     const rB = statusRank[b.overall_status] ?? 9;
     if (rA !== rB) return rA - rB;
@@ -744,29 +743,34 @@ function renderTable() {
     return minA - minB;
   });
 
+  const showingEl = document.getElementById("tableShowingText");
+  if (showingEl) {
+    showingEl.textContent = `Hiển thị ${list.length} / ${(state.resultsData.items || []).length} tên miền`;
+  }
+
   if (list.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="4" class="empty-state">Không tìm thấy tên miền nào phù hợp với bộ lọc hiện tại.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" class="ds-empty-state">Không tìm thấy tên miền nào phù hợp với bộ lọc hiện tại.</td></tr>`;
     return;
   }
 
   tbody.innerHTML = list
     .map((it) => {
-      const sslBadge = formatStatusBadge(it.ssl_status, it.ssl_days_left, true);
+      const sslBadge = formatStatusBadge(it.ssl_status, it.ssl_days_left);
       const sslBar = formatProgressBar(it.ssl_status, it.ssl_days_left, 90);
-      const domBadge = formatStatusBadge(it.domain_status, it.domain_days_left, false);
+      const domBadge = formatStatusBadge(it.domain_status, it.domain_days_left);
       const domBar = formatProgressBar(it.domain_status, it.domain_days_left, 365);
 
       const sslExpText = it.ssl_valid_to
         ? `Hết hạn: <strong>${escapeHtml(it.ssl_valid_to)}</strong>`
         : it.ssl_error
-        ? `<span style="color:#f87171">${escapeHtml(it.ssl_error)}</span>`
+        ? `<span style="color:var(--ds-red-fg)">${escapeHtml(it.ssl_error)}</span>`
         : "Đang chờ GitHub Actions quét SSL...";
 
       const domExpText = it.domain_expiry_date
         ? `Hết hạn: <strong>${escapeHtml(it.domain_expiry_date)}</strong>`
         : it.domain_error
-        ? `<span style="color:#fbbf24">${escapeHtml(it.domain_error)}</span>`
-        : "Chưa có dữ liệu WHOIS";
+        ? `<span style="color:#d97706">${escapeHtml(it.domain_error)}</span>`
+        : "Đang chờ quét VNNIC / WHOIS...";
 
       return `
         <tr>
@@ -778,7 +782,6 @@ function renderTable() {
               <span class="port-tag">:${it.port || 443}</span>
             </div>
             <div class="meta-tags">
-              <span class="group-pill">${escapeHtml(it.group || "Default")}</span>
               ${it.ssl_ip ? `<span class="ip-pill" title="Địa chỉ IP">${escapeHtml(it.ssl_ip)}</span>` : ""}
               ${it.ssl_protocol ? `<span class="ip-pill">${escapeHtml(it.ssl_protocol)}</span>` : ""}
             </div>
@@ -786,9 +789,13 @@ function renderTable() {
           </td>
 
           <td>
+            <span class="group-pill">${escapeHtml(it.group || "Default")}</span>
+          </td>
+
+          <td>
             <div class="status-cell-top">
               ${sslBadge}
-              ${it.ssl_latency_ms ? `<span style="font-size:11px;color:#64748b">⚡ ${it.ssl_latency_ms}ms</span>` : ""}
+              ${it.ssl_latency_ms ? `<span style="font-size:11.5px;color:var(--ds-text-muted)">⚡ ${it.ssl_latency_ms}ms</span>` : ""}
             </div>
             ${sslBar}
             <div class="cell-subinfo">
@@ -800,24 +807,24 @@ function renderTable() {
           <td>
             <div class="status-cell-top">
               ${domBadge}
-              <span style="font-size:11px;color:#64748b">${escapeHtml(it.domain_root || extractRootDomain(it.domain))}</span>
+              <span style="font-size:11.5px;color:var(--ds-text-muted)">${escapeHtml(it.domain_root || extractRootDomain(it.domain))}</span>
             </div>
             ${domBar}
             <div class="cell-subinfo">
               <div>${domExpText}</div>
-              <div>Registrar: ${escapeHtml(it.domain_registrar || "—")}</div>
+              <div>Registrar: <strong>${escapeHtml(it.domain_registrar || "—")}</strong></div>
             </div>
           </td>
 
-          <td>
-            <div class="action-btns">
-              <button class="btn btn-ghost btn-sm" onclick="openDetailModal('${escapeHtml(it.domain)}', ${it.port || 443})" title="Xem chi tiết chứng chỉ & WHOIS">
-                🔍 Chi tiết
+          <td style="text-align: center">
+            <div class="ds-action-group">
+              <button class="ds-act-btn" onclick="openDetailModal('${escapeHtml(it.domain)}', ${it.port || 443})" title="Xem chi tiết chứng chỉ & WHOIS">
+                🔍
               </button>
-              <button class="btn btn-ghost btn-sm" onclick="openEditDomainModal('${escapeHtml(it.domain)}', ${it.port || 443})" title="Sửa cấu hình tên miền">
+              <button class="ds-act-btn" onclick="openEditDomainModal('${escapeHtml(it.domain)}', ${it.port || 443})" title="Chỉnh sửa tên miền">
                 ✏️
               </button>
-              <button class="btn btn-danger-ghost btn-sm" onclick="deleteDomain('${escapeHtml(it.domain)}', ${it.port || 443})" title="Xóa khỏi danh sách theo dõi">
+              <button class="ds-act-btn act-delete" onclick="deleteDomain('${escapeHtml(it.domain)}', ${it.port || 443})" title="Xóa khỏi danh sách theo dõi">
                 🗑️
               </button>
             </div>
@@ -837,7 +844,6 @@ function closeModal(id) {
   document.getElementById(id).classList.add("hidden");
 }
 
-// Detail Inspector Modal
 window.openDetailModal = function (domain, port) {
   const it = (state.resultsData.items || []).find(
     (x) => x.domain === domain && Number(x.port || 443) === Number(port || 443)
@@ -868,7 +874,7 @@ window.openDetailModal = function (domain, port) {
       </div>
 
       <div class="detail-card">
-        <h4>🌍 Thông tin Tên miền (WHOIS / RDAP)</h4>
+        <h4>🌍 Thông tin Tên miền (VNNIC / WHOIS / RDAP)</h4>
         <div class="kv-row"><span class="kv-key">Trạng thái:</span><span class="kv-val">${formatStatusBadge(it.domain_status, it.domain_days_left)}</span></div>
         <div class="kv-row"><span class="kv-key">Tên miền gốc (Root):</span><span class="kv-val">${escapeHtml(it.domain_root || extractRootDomain(it.domain))}</span></div>
         <div class="kv-row"><span class="kv-key">Nhà đăng ký (Registrar):</span><span class="kv-val">${escapeHtml(it.domain_registrar || "—")}</span></div>
@@ -884,7 +890,6 @@ window.openDetailModal = function (domain, port) {
   openModal("modalDetail");
 };
 
-// Add / Edit Domain Handlers
 window.openEditDomainModal = function (domain, port) {
   const entry = (state.domainsConfig.domains || []).find(
     (d) => cleanHostname(d.domain) === domain && Number(d.port || 443) === Number(port || 443)
@@ -925,7 +930,6 @@ window.deleteDomain = async function (domain, port) {
   }
 };
 
-// Export CSV
 function exportToCsv() {
   const items = state.resultsData.items || [];
   const headers = [
@@ -974,10 +978,64 @@ function exportToCsv() {
   URL.revokeObjectURL(url);
 }
 
+function setSidebarActiveFilter(filterVal) {
+  document.querySelectorAll("[data-nav-filter]").forEach((li) => {
+    li.classList.toggle("active", li.getAttribute("data-nav-filter") === filterVal);
+  });
+}
+
 // Event Listeners Initialization
 document.addEventListener("DOMContentLoaded", () => {
+  initTheme();
   initGitHubConfig();
   loadAllData();
+
+  // Sidebar Toggle
+  document.getElementById("btnToggleSidebar").addEventListener("click", () => {
+    const layout = document.getElementById("appLayout");
+    if (window.innerWidth <= 860) {
+      layout.classList.toggle("sidebar-mobile-open");
+    } else {
+      layout.classList.toggle("sidebar-collapsed");
+    }
+  });
+
+  // Theme Toggle
+  document.getElementById("btnThemeToggle").addEventListener("click", () => {
+    const isDark = document.body.classList.contains("dark-theme");
+    applyTheme(isDark ? "light" : "dark");
+  });
+
+  // Sidebar Filter Navigation Items
+  document.querySelectorAll("[data-nav-filter]").forEach((li) => {
+    li.addEventListener("click", (e) => {
+      e.preventDefault();
+      const f = li.getAttribute("data-nav-filter");
+      document.getElementById("filterStatus").value = f;
+      setSidebarActiveFilter(f);
+      renderTable();
+      if (window.innerWidth <= 860) {
+        document.getElementById("appLayout").classList.remove("sidebar-mobile-open");
+      }
+    });
+  });
+
+  // Notification Bell -> Filter Attention
+  document.getElementById("btnBellAlert").addEventListener("click", () => {
+    document.getElementById("filterStatus").value = "attention";
+    setSidebarActiveFilter("attention");
+    renderTable();
+  });
+
+  // Reset Filter Button (DashStack signature)
+  document.getElementById("btnResetFilter").addEventListener("click", () => {
+    document.getElementById("searchInput").value = "";
+    document.getElementById("filterStatus").value = "all";
+    document.getElementById("filterGroup").value = "all";
+    document.getElementById("sortBy").value = "urgency";
+    setSidebarActiveFilter("all");
+    renderTable();
+  });
 
   // Close buttons for modals
   document.querySelectorAll("[data-close]").forEach((btn) => {
@@ -987,26 +1045,37 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("statusBannerClose").addEventListener("click", hideBanner);
 
   // KPI Card Quick Filters
-  document.querySelectorAll(".kpi-card").forEach((card) => {
+  document.querySelectorAll(".ds-stat-card").forEach((card) => {
     card.addEventListener("click", () => {
       const f = card.getAttribute("data-filter");
       const sel = document.getElementById("filterStatus");
       if (f === "all") sel.value = "all";
       else if (f === "ok") sel.value = "ok";
       else sel.value = "attention";
+      setSidebarActiveFilter(sel.value);
       renderTable();
     });
   });
 
   // Search & Filter inputs
   document.getElementById("searchInput").addEventListener("input", renderTable);
-  document.getElementById("filterStatus").addEventListener("change", renderTable);
+  document.getElementById("filterStatus").addEventListener("change", (e) => {
+    setSidebarActiveFilter(e.target.value);
+    renderTable();
+  });
   document.getElementById("filterGroup").addEventListener("change", renderTable);
   document.getElementById("sortBy").addEventListener("change", renderTable);
+
+  // Export CSV
   document.getElementById("btnExportCsv").addEventListener("click", exportToCsv);
+  document.getElementById("sideBtnExportCsv").addEventListener("click", (e) => {
+    e.preventDefault();
+    exportToCsv();
+  });
 
   // Open Add Domain Modal
-  document.getElementById("btnAddDomain").addEventListener("click", () => {
+  const openAddDomainFn = (e) => {
+    if (e) e.preventDefault();
     document.getElementById("modalDomainTitle").textContent = "➕ Thêm Tên miền theo dõi";
     document.getElementById("formDomain").reset();
     document.getElementById("domainId").value = "";
@@ -1014,7 +1083,9 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("inputCheckSsl").checked = true;
     document.getElementById("inputCheckDomain").checked = true;
     openModal("modalDomain");
-  });
+  };
+  document.getElementById("btnAddDomain").addEventListener("click", openAddDomainFn);
+  document.getElementById("sideBtnAddDomain").addEventListener("click", openAddDomainFn);
 
   // Submit Add / Edit Domain Form
   document.getElementById("formDomain").addEventListener("submit", async (e) => {
@@ -1068,7 +1139,6 @@ document.addEventListener("DOMContentLoaded", () => {
     mergeConfigIntoResults();
     renderAll();
 
-    // Perform instant browser RDAP & DNS lookup immediately
     performBrowserLiveCheck(newEntry);
 
     try {
@@ -1079,10 +1149,13 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // Bulk Import Modal
-  document.getElementById("btnBulkAdd").addEventListener("click", () => {
+  const openBulkFn = (e) => {
+    if (e) e.preventDefault();
     document.getElementById("bulkTextarea").value = "";
     openModal("modalBulk");
-  });
+  };
+  document.getElementById("btnBulkAdd").addEventListener("click", openBulkFn);
+  document.getElementById("sideBtnBulkAdd").addEventListener("click", openBulkFn);
 
   document.getElementById("formBulk").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -1166,7 +1239,9 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   document.getElementById("btnSettings").addEventListener("click", openSettingsFn);
+  document.getElementById("sideBtnSettings").addEventListener("click", openSettingsFn);
   document.getElementById("syncModeBadge").addEventListener("click", openSettingsFn);
+  document.getElementById("profileTrigger").addEventListener("click", openSettingsFn);
   document.getElementById("linkOpenSetupGuide").addEventListener("click", openSettingsFn);
 
   // Save Settings Form
@@ -1205,9 +1280,12 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // Run Check Now & Test Email Buttons
-  document.getElementById("btnRunCheckNow").addEventListener("click", () => {
+  const runScanFn = (e) => {
+    if (e) e.preventDefault();
     triggerWorkflowDispatch(false, false);
-  });
+  };
+  document.getElementById("btnRunCheckNow").addEventListener("click", runScanFn);
+  document.getElementById("sideBtnRunScan").addEventListener("click", runScanFn);
 
   document.getElementById("btnTriggerTestEmail").addEventListener("click", () => {
     closeModal("modalSettings");
