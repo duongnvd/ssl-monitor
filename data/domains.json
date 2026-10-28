@@ -6,9 +6,7 @@
     "critical_days_domain": 14,
     "notify_mode": "alert_only",
     "weekly_digest_day": "monday",
-    "default_recipients": [
-      "admin@example.com"
-    ],
+    "default_recipients": [],
     "dashboard_url": "https://duongnvd.github.io/ssl-monitor/"
   },
   "domains": [
@@ -40,6 +38,17 @@
       "port": 443,
       "group": "Infrastructure",
       "notes": "CDN & DNS Provider",
+      "check_ssl": true,
+      "check_domain": true,
+      "notify_emails": [],
+      "custom_domain_expiry": ""
+    },
+    {
+      "id": "dom-1793171502275",
+      "domain": "nhakhoavanthanh.com.vn",
+      "port": 443,
+      "group": "Infrastructure",
+      "notes": "",
       "check_ssl": true,
       "check_domain": true,
       "notify_emails": [],
